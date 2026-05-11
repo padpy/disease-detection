@@ -1,13 +1,22 @@
-"""SAM 3 segmenter (``facebook/sam3``) for wheat-head + leaf masks.
+"""SAM 3 segmenters (``facebook/sam3``) for wheat-head + leaf masks.
 
-Drives Meta's regular SAM 3 model via HuggingFace transformers — no
-ONNX export. The ``Sam3Tracker`` head accepts visual prompts (points,
-boxes) and returns per-object masks at the image's original
-resolution, which matches the on-device pipeline's contract.
+Two classes share the same checkpoint:
 
-Encode-once + decode-many is handled implicitly: we batch every
-detection's prompts into a single ``model(**inputs)`` call. SAM 3 runs
-the image encoder once and the prompt encoder / mask decoder per
+  * ``Sam3Segmenter`` — Promptable Visual Segmentation (PVS) via the
+    ``Sam3Tracker`` head. Accepts point + box prompts and returns one
+    mask per prompted object.
+  * ``Sam3TextSegmenter`` — Promptable Concept Segmentation (PCS) via
+    the base ``Sam3Model`` head. Accepts a free-text concept (e.g.
+    ``"wheat head"``) and returns every instance the model finds.
+
+The wheat pipeline uses the tracker head to mask YOLO detections, then
+the text head twice — once at default confidence to reject YOLO
+false positives, once at high confidence to recover YOLO false
+negatives. See ``application._reconcile_with_text``.
+
+Encode-once + decode-many is handled implicitly: each segmenter batches
+every detection's prompts into a single ``model(**inputs)`` call. SAM 3
+runs the image encoder once and the prompt encoder / mask decoder per
 object inside that one forward pass, so this is equivalent to running
 the encoder once and the decoder N times the way the mobile pipeline
 does — without us needing to drive the two halves separately.
@@ -151,3 +160,92 @@ class Sam3Segmenter:
             mask = per_image_masks[i, 0]
             masks.append(mask.numpy().astype(np.uint8))
         return masks
+
+
+@dataclass
+class Sam3TextDetection:
+    """One instance returned by ``Sam3TextSegmenter.detect``.
+
+    ``mask`` is a uint8 binary mask at the input image's resolution;
+    ``bbox`` is xyxy in image-pixel coords; ``score`` is the
+    instance-level confidence the model assigned to the concept match.
+    """
+
+    mask: np.ndarray
+    bbox: Tuple[float, float, float, float]
+    score: float
+
+
+class Sam3TextSegmenter:
+    """Promptable Concept Segmentation via ``Sam3Model``.
+
+    Given an image and a text concept (e.g. ``"wheat head"``), returns
+    every instance the model thinks matches the concept above the
+    confidence threshold. Used by the wheat pipeline to cross-check
+    YOLO detections against a language-grounded second opinion.
+    """
+
+    def __init__(
+        self,
+        model_id: str = SAM3_MODEL_ID,
+        device: Optional[str] = None,
+    ):
+        # See ``Sam3Segmenter`` for the same lazy-import rationale.
+        import torch  # noqa: WPS433
+        from transformers import Sam3Model, Sam3Processor
+
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = (
+            Sam3Model.from_pretrained(model_id).eval().to(self.device)
+        )
+        self.processor = Sam3Processor.from_pretrained(model_id)
+        self._torch = torch
+
+    def detect(
+        self,
+        image_rgb: np.ndarray,
+        text: str,
+        *,
+        threshold: float = 0.5,
+        mask_threshold: float = 0.5,
+    ) -> List[Sam3TextDetection]:
+        """Run text-prompted instance segmentation.
+
+        ``threshold`` filters the per-instance confidence; only
+        detections above this survive. ``mask_threshold`` is the cutoff
+        applied to the predicted mask logits during binarisation.
+        """
+        torch = self._torch
+        pil = Image.fromarray(image_rgb)
+        inputs = self.processor(
+            images=pil, text=text, return_tensors="pt"
+        ).to(self.device)
+
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+
+        results = self.processor.post_process_instance_segmentation(
+            outputs,
+            threshold=threshold,
+            mask_threshold=mask_threshold,
+            target_sizes=inputs.get("original_sizes").tolist(),
+        )[0]
+
+        raw_masks = results["masks"]
+        raw_boxes = results["boxes"]
+        raw_scores = results["scores"]
+        # The processor can return either tensors or lists depending on
+        # how many instances survived the threshold. Normalise to a
+        # Python list of (mask, bbox, score).
+        out: List[Sam3TextDetection] = []
+        for mask_t, box_t, score_t in zip(raw_masks, raw_boxes, raw_scores):
+            mask = mask_t.cpu().numpy() if hasattr(mask_t, "cpu") else np.asarray(mask_t)
+            mask = (mask > 0).astype(np.uint8)
+            box = (box_t.cpu().tolist() if hasattr(box_t, "cpu") else list(box_t))
+            score = float(score_t.cpu().item() if hasattr(score_t, "cpu") else score_t)
+            out.append(Sam3TextDetection(
+                mask=mask,
+                bbox=(float(box[0]), float(box[1]), float(box[2]), float(box[3])),
+                score=score,
+            ))
+        return out

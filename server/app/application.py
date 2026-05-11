@@ -19,7 +19,12 @@ from tiled_yolo import (
     CROP_BBOX_PADDING,
 )
 from sam_segmenter import SAM_INPUT_SIZE, SamSegmenter
-from sam3_segmenter import SAM3_MODEL_ID, Sam3Prompt, Sam3Segmenter
+from sam3_segmenter import (
+    SAM3_MODEL_ID,
+    Sam3Prompt,
+    Sam3Segmenter,
+    Sam3TextSegmenter,
+)
 from wheat_head_detector import WheatHeadDetector
 
 LEAF_MODEL = "models/leaf-yolo11m-seg.pt"
@@ -43,6 +48,22 @@ WHEAT_WORKING_LONG_EDGE = SAM_INPUT_SIZE
 WHEAT_CONF_THRESHOLD = 0.25
 WHEAT_NMS_IOU = 0.5
 WHEAT_MAX_DETECTIONS = 100
+
+# Two-pass SAM 3 text reconciliation (see ``_reconcile_with_text``).
+# Pass 1 — default conf — runs ``"wheat head"`` PCS over the working
+# image and treats any YOLO mask without overlap with a default-conf
+# text mask as a false positive (rejected).
+# Pass 2 — high conf — re-runs PCS at a stricter threshold and adds
+# any text-derived mask that doesn't overlap a surviving YOLO mask,
+# recovering wheat heads the YOLO detector missed.
+# ``WHEAT_TEXT_OVERLAP_MIN`` is the IoU floor used for "the masks
+# overlap". 0.1 is permissive on purpose — the goal is to filter
+# masks that are completely unrelated to the language opinion, not to
+# enforce tight agreement.
+WHEAT_TEXT_PROMPT = "wheat head"
+WHEAT_TEXT_DEFAULT_CONF = 0.5
+WHEAT_TEXT_HIGH_CONF = 0.7
+WHEAT_TEXT_OVERLAP_MIN = 0.1
 
 class Application(ApplicationInterface):
     def __init__(self,
@@ -78,12 +99,19 @@ class Application(ApplicationInterface):
             # has access to; loading failures degrade the wheat path to
             # rect masks (same fallback as ``self.sam``).
             self.sam3 = self._try_load_sam3()
+            # SAM 3 text head — same checkpoint, ``Sam3Model`` instead
+            # of the tracker. Drives the two-pass ``"wheat head"`` PCS
+            # reconciliation. Optional: if it fails to load, the
+            # pipeline runs without text reconciliation and the YOLO
+            # output is taken at face value.
+            self.sam3_text = self._try_load_sam3_text()
         else:
             self.segmentation = None
             self.wheat_head = None
             self.classification = None
             self.sam = None
             self.sam3 = None
+            self.sam3_text = None
 
     @staticmethod
     def _try_load_sam():
@@ -104,6 +132,17 @@ class Application(ApplicationInterface):
             # accepted on the gated repo, network blocked at startup.
             # Log and fall back to rect masks rather than crashing boot.
             print(f"[application] SAM3 load failed, falling back to rect masks: {exc}")
+            return None
+
+    @staticmethod
+    def _try_load_sam3_text():
+        try:
+            return Sam3TextSegmenter(SAM3_MODEL_ID)
+        except Exception as exc:  # pragma: no cover - defensive
+            print(
+                f"[application] SAM3 text head load failed, "
+                f"reconciliation disabled: {exc}"
+            )
             return None
 
     def segment_plant(self, file, task='leaf', data=None):
@@ -239,12 +278,20 @@ class Application(ApplicationInterface):
         h, w = working.shape[:2]
 
         detections = self._wheat_head_detect(working)
+        masks = self._wheat_head_masks(working, detections)
+
+        # Two-pass SAM 3 text reconciliation: drop YOLO false
+        # positives that don't agree with a "wheat head" PCS at
+        # default conf, then add high-conf PCS instances YOLO missed.
+        # Done before the normalised-bbox/polygon dump so both lists
+        # stay aligned with the final detection set.
+        detections, masks = self._reconcile_with_text(
+            working, detections, masks
+        )
 
         self._plants[guid]["bounding_boxes"] = [
             [d.x1 / w, d.y1 / h, d.x2 / w, d.y2 / h] for d in detections
         ]
-
-        masks = self._wheat_head_masks(working, detections)
         self._plants[guid]["masks"] = [
             self._mask_to_normalised_polygon(m, w, h) for m in masks
         ]
@@ -332,6 +379,93 @@ class Application(ApplicationInterface):
             else:
                 out.append(cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST))
         return out
+
+    def _reconcile_with_text(self, working, detections, masks):
+        """Cross-check YOLO detections against SAM 3 "wheat head" PCS.
+
+        Two passes over the same working image:
+
+          1. Default-conf PCS (``WHEAT_TEXT_DEFAULT_CONF``). Any YOLO
+             mask that does NOT overlap (mask IoU >
+             ``WHEAT_TEXT_OVERLAP_MIN``) at least one PCS instance is
+             dropped — the language model is unwilling to agree it's
+             a wheat head, so we treat it as a YOLO false positive.
+          2. High-conf PCS (``WHEAT_TEXT_HIGH_CONF``). Any PCS
+             instance that does NOT overlap a surviving YOLO mask is
+             added as a new detection — these are wheat heads YOLO
+             missed but SAM 3 is confident about.
+
+        Both passes share the cost of the image encoder twice
+        (one forward per text prompt), but PCS instance counts are
+        small and the encoder isn't huge, so this is cheaper than
+        re-running the whole detection pipeline at a lower YOLO conf.
+        Falls through unmodified if the text head failed to load
+        (``self.sam3_text is None``) or no detections came in.
+        """
+        if self.sam3_text is None or not detections:
+            return detections, masks
+
+        # Pass 1 — reject YOLO false positives.
+        default_hits = self.sam3_text.detect(
+            working,
+            WHEAT_TEXT_PROMPT,
+            threshold=WHEAT_TEXT_DEFAULT_CONF,
+        )
+        if default_hits:
+            default_masks = [hit.mask for hit in default_hits]
+            keep_idx = [
+                i for i, m in enumerate(masks)
+                if any(
+                    self._mask_iou(m, dm) > WHEAT_TEXT_OVERLAP_MIN
+                    for dm in default_masks
+                )
+            ]
+            if len(keep_idx) != len(detections):
+                print(
+                    f"[wheat] text-pass-1 dropped "
+                    f"{len(detections) - len(keep_idx)}/{len(detections)} "
+                    f"YOLO detections without text overlap"
+                )
+            detections = [detections[i] for i in keep_idx]
+            masks = [masks[i] for i in keep_idx]
+
+        # Pass 2 — add missed wheat heads.
+        high_hits = self.sam3_text.detect(
+            working,
+            WHEAT_TEXT_PROMPT,
+            threshold=WHEAT_TEXT_HIGH_CONF,
+        )
+        added = 0
+        for hit in high_hits:
+            if any(self._mask_iou(hit.mask, m) > WHEAT_TEXT_OVERLAP_MIN
+                   for m in masks):
+                continue
+            x1, y1, x2, y2 = hit.bbox
+            detections.append(Detection(
+                x1=float(x1), y1=float(y1),
+                x2=float(x2), y2=float(y2),
+                score=float(hit.score),
+            ))
+            masks.append(hit.mask)
+            added += 1
+        if added:
+            print(f"[wheat] text-pass-2 added {added} missed wheat heads")
+        return detections, masks
+
+    @staticmethod
+    def _mask_iou(a, b):
+        """Binary mask IoU. Returns 0 for differing shapes."""
+        if a is None or b is None:
+            return 0.0
+        if a.shape != b.shape:
+            return 0.0
+        a_bool = a.astype(bool)
+        b_bool = b.astype(bool)
+        inter = int(np.logical_and(a_bool, b_bool).sum())
+        if inter == 0:
+            return 0.0
+        union = int(np.logical_or(a_bool, b_bool).sum())
+        return inter / float(union) if union > 0 else 0.0
 
     @staticmethod
     def _resize_longest_edge(image, target):
