@@ -96,7 +96,11 @@ private let kAppGroupId = "group.io.npcomplete.gophereye.vpn"
             let name = (args["tunnelName"] as? String) ?? "Gopher Eye"
             installConfig(networkId: networkId, displayName: name) { error in
                 if let error = error {
-                    result(FlutterError(code: "INSTALL", message: error.localizedDescription, details: nil))
+                    if (error as NSError).code == NEVPNError.configurationReadWriteFailed.rawValue {
+                        result(FlutterError(code: "PERMISSION_DENIED", message: error.localizedDescription, details: nil))
+                    } else {
+                        result(FlutterError(code: "INSTALL", message: error.localizedDescription, details: nil))
+                    }
                 } else {
                     result(nil)
                 }
