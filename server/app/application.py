@@ -11,6 +11,7 @@ from scipy import ndimage
 
 from services import StorageService, SqliteStorageService
 from tiled_yolo import (
+    Detection,
     tiled_detect,
     pack_into_crops,
     TILE_SIZE,
@@ -18,11 +19,26 @@ from tiled_yolo import (
     CROP_BBOX_PADDING,
 )
 from sam_segmenter import SAM_INPUT_SIZE, SamSegmenter
+from wheat_head_detector import WheatHeadDetector
 
 LEAF_MODEL = "models/leaf-yolo11m-seg.pt"
-SPIKE_MODEL = "models/spike-yolo11x-seg.pt"
+# Same YOLO26 ONNX export the Flutter app loads via onnxruntime — see
+# `mobile-app/lib/services/wheat_head_pipeline.dart`. Running the same
+# weights with the same letterbox + parser keeps the server and on-device
+# wheat detections bit-for-bit comparable.
+WHEAT_HEAD_ONNX = "models/yolo26-wheat-head.onnx"
 SAM_ENCODER = "models/sam3_efficient_encoder.onnx"
 SAM_DECODER = "models/sam3_efficient_decoder.onnx"
+
+# Mobile-parity wheat-head pipeline constants (see
+# `wheat_head_pipeline.dart`). The working image is the longest-edge-1024
+# resize that every prompt, mask, and stored normalised coord references.
+# The detector itself owns the 640-letterbox; the YOLO input size lives
+# inside ``WheatHeadDetector``.
+WHEAT_WORKING_LONG_EDGE = SAM_INPUT_SIZE
+WHEAT_CONF_THRESHOLD = 0.25
+WHEAT_NMS_IOU = 0.5
+WHEAT_MAX_DETECTIONS = 100
 
 class Application(ApplicationInterface):
     def __init__(self,
@@ -40,7 +56,11 @@ class Application(ApplicationInterface):
 
         if load_models:
             self.segmentation = YOLO(LEAF_MODEL)
-            self.segmentation_spike = YOLO(SPIKE_MODEL)
+            # Wheat-head detector is the same ONNX export the mobile
+            # pipeline runs on-device. See ``wheat_head_detector.py`` for
+            # the parser; the runtime defaults to CPUExecutionProvider so
+            # the server stays portable.
+            self.wheat_head = WheatHeadDetector(WHEAT_HEAD_ONNX)
             label2id = {'Healthy-Leaf': 0, 'Downy-Leaf': 1, 'Powdery-Leaf': 2}
             id2label = {0: 'Healthy-Leaf', 1: 'Downy-Leaf', 2: 'Powdery-Leaf'}
             self.classification = Classification("models/swinv2-tiny-patch4-window8-256", label2id=label2id, id2label=id2label)
@@ -50,7 +70,7 @@ class Application(ApplicationInterface):
             self.sam = self._try_load_sam()
         else:
             self.segmentation = None
-            self.segmentation_spike = None
+            self.wheat_head = None
             self.classification = None
             self.sam = None
 
@@ -96,7 +116,21 @@ class Application(ApplicationInterface):
         return guid
 
     def _process_segmentation(self, guid, task):
-        """New pipeline:
+        """Dispatch to the per-task pipeline.
+
+        - ``leaf``: full-resolution tiled YOLO + per-crop SAM. Phones
+          shoot at 4032×3024+, so the leaf detector needs to see tiles
+          at native scale to find small targets near the edges.
+        - ``spike``: mobile-parity wheat-head pipeline (1024-longest-
+          edge working image → YOLO26 at 640 → single SAM encode →
+          per-box SAM decode). See ``_process_wheat_head``.
+        """
+        if task == 'spike':
+            return self._process_wheat_head(guid)
+        return self._process_leaf(guid)
+
+    def _process_leaf(self, guid):
+        """Leaf pipeline:
 
         1. Slide a 1280×1280 window across the image with stride 640 and
            run YOLO detection on each tile (boxes only — we drop masks).
@@ -110,10 +144,9 @@ class Application(ApplicationInterface):
         image = self.read_image(image_path)
         h, w = image.shape[:2]
 
-        model = self.segmentation if task == 'leaf' else self.segmentation_spike
         detections = tiled_detect(
             image,
-            model,
+            self.segmentation,
             tile=TILE_SIZE,
             stride=TILE_STRIDE,
         )
@@ -133,23 +166,156 @@ class Application(ApplicationInterface):
             self._mask_to_normalised_polygon(m, w, h) for m in masks
         ]
 
-        for i, mask in enumerate(masks):
+        for mask in masks:
             if mask is None or mask.sum() == 0:
                 self._plants[guid]["labels"].append("Unknown")
                 continue
             mask_chw = mask[:, :, np.newaxis]
             subimage = self._crop_image(image, mask_chw)
             cropped_mask = self._crop_image(mask_chw, mask_chw)
-            if task == 'leaf':
-                label = self.classification.classify(cropped_mask * subimage)
-            elif task == 'spike':
-                label = self._score_spike(subimage, cropped_mask)
-            else:
-                label = "Unknown"
+            label = self.classification.classify(cropped_mask * subimage)
             self._plants[guid]["labels"].append(label)
 
         self._plants[guid]["status"] = "complete"
         self.storage.save_plant(self._plants[guid])
+
+    def _process_wheat_head(self, guid):
+        """Mobile-parity wheat-head pipeline.
+
+        Mirrors ``mobile-app/lib/services/wheat_head_pipeline.dart``:
+
+          1. Decode the capture and resize so its longest edge equals
+             1024 — the working image. This is the canonical reference
+             frame for every prompt, mask, and stored normalised coord.
+             SAM's decoder math assumes the encoder's input is exactly
+             1024 on the long side; the on-device pipeline produces a
+             working image at that scale and we do the same here so the
+             two paths can be diffed.
+          2. Run YOLO26 (wheat-head detector) on the working image at
+             ``imgsz=640``. Ultralytics handles letterboxing into the
+             640 canvas and reports xyxy in working-image coords,
+             exactly matching the Dart pipeline's ``_parseYoloOutput``
+             remap.
+          3. Encode the working image **once** with SAM. The encoder's
+             longest-edge-to-1024 paste uses the same scale + zero-pad
+             as the mobile encoder, so the embedding is interchangeable.
+          4. For each detection prompt the SAM decoder with the box's
+             centroid (label 1 = foreground) and the box itself (corner
+             labels 2/3). SAM reconstructs the mask at working-image
+             resolution.
+
+        Bounding boxes / masks are stored as normalised coords against
+        the working image; uniform-scale resize means
+        ``x / working_w == x / original_w`` so the existing contract
+        the rest of the server consumes is unchanged.
+        """
+        image_path = os.path.join(self.image_folder, f'{guid}.jpeg')
+        full_image = self.read_image(image_path)
+        working = self._resize_longest_edge(
+            full_image, WHEAT_WORKING_LONG_EDGE
+        )
+        h, w = working.shape[:2]
+
+        detections = self._wheat_head_detect(working)
+
+        self._plants[guid]["bounding_boxes"] = [
+            [d.x1 / w, d.y1 / h, d.x2 / w, d.y2 / h] for d in detections
+        ]
+
+        masks = self._wheat_head_masks(working, detections)
+        self._plants[guid]["masks"] = [
+            self._mask_to_normalised_polygon(m, w, h) for m in masks
+        ]
+
+        for mask in masks:
+            if mask is None or mask.sum() == 0:
+                self._plants[guid]["labels"].append("Unknown")
+                continue
+            mask_chw = mask[:, :, np.newaxis]
+            subimage = self._crop_image(working, mask_chw)
+            cropped_mask = self._crop_image(mask_chw, mask_chw)
+            self._plants[guid]["labels"].append(
+                self._score_spike(subimage, cropped_mask)
+            )
+
+        self._plants[guid]["status"] = "complete"
+        self.storage.save_plant(self._plants[guid])
+
+    def _wheat_head_detect(self, working):
+        """Single-pass YOLO26 ONNX on the working image.
+
+        Returns image-space ``Detection`` objects in working-image
+        coordinates. Delegates to the same ONNX runner the mobile app
+        uses (``WheatHeadDetector``), so the conf/IoU thresholds, the
+        letterbox math, and the parsed boxes match the on-device path.
+        """
+        raw = self.wheat_head.detect(
+            working,
+            score_threshold=WHEAT_CONF_THRESHOLD,
+            nms_iou=WHEAT_NMS_IOU,
+            max_detections=WHEAT_MAX_DETECTIONS,
+        )
+        return [
+            Detection(x1=x1, y1=y1, x2=x2, y2=y2, score=s)
+            for (x1, y1, x2, y2, s) in raw
+        ]
+
+    def _wheat_head_masks(self, working, detections):
+        """SAM masks for each wheat-head detection.
+
+        The encoder runs **once** over the whole working image — same
+        global embedding the on-device pipeline reuses across all
+        per-head decoder passes. Each decoder pass gets the centroid as
+        a foreground point and the YOLO box as a box prompt, matching
+        the prompt set in ``wheat_head_pipeline.dart`` ``run``.
+        Falls back to rect-over-bbox masks if SAM isn't loaded so the
+        rest of the pipeline (scoring, polygon export) still has
+        something to operate on.
+        """
+        if not detections:
+            return []
+        h, w = working.shape[:2]
+        if self.sam is None:
+            fallback = []
+            for d in detections:
+                m = np.zeros((h, w), dtype=np.uint8)
+                x1 = int(max(0, d.x1))
+                y1 = int(max(0, d.y1))
+                x2 = int(min(w, d.x2))
+                y2 = int(min(h, d.y2))
+                m[y1:y2, x1:x2] = 1
+                fallback.append(m)
+            return fallback
+
+        embedding, letterbox = self.sam.encode(working)
+        masks = []
+        for d in detections:
+            cx, cy = d.centroid
+            mask = self.sam.predict(
+                embedding=embedding,
+                letterbox=letterbox,
+                points=[(cx, cy)],
+                point_labels=[1],
+                bbox=(d.x1, d.y1, d.x2, d.y2),
+            )
+            masks.append(mask)
+        return masks
+
+    @staticmethod
+    def _resize_longest_edge(image, target):
+        """Uniform-scale resize so ``max(h, w) == target``. Matches
+        ``WheatHeadPipeline.resizeLongestEdge`` in the mobile code:
+        SAM's decoder reconstructs masks against a 1024-letterbox, so
+        the working image must already be at 1024 on the long side
+        before it ever reaches the encoder."""
+        h, w = image.shape[:2]
+        long_edge = max(h, w)
+        if long_edge == target:
+            return image
+        scale = target / float(long_edge)
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+        return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
     def _segment_from_detections(self, image, detections):
         """Produce one binary mask per detection.

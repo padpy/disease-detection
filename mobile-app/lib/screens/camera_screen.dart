@@ -146,9 +146,14 @@ class _CameraScreenState extends State<CameraScreen>
     }
     await previous?.dispose();
 
+    // Capture at the sensor's native resolution. Downstream pipelines
+    // (wheat YOLO26, SAM, server-side detection) re-scale to their own
+    // working frames; downsampling at capture time was throwing away
+    // detail that the wheat-head detector actually relies on, and the
+    // server explicitly wants the original-resolution upload.
     final next = CameraController(
       description,
-      ResolutionPreset.high,
+      ResolutionPreset.max,
       enableAudio: false,
       imageFormatGroup: ImageFormatGroup.jpeg,
     );
