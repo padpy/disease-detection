@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+#
+# One-time host setup sanity check for the ZeroTier broker.
+#   - confirms zerotier-one is running and reachable
+#   - confirms the controller knows about BROKER_ZT_NETWORK_ID
+#   - confirms the broker can read the local auth token
+#
+# Idempotent: safe to re-run.
+
+set -euo pipefail
+
+if [[ $EUID -ne 0 ]]; then
+    echo "Run as root (sudo)." >&2
+    exit 1
+fi
+
+: "${BROKER_ZT_NETWORK_ID:?must be set in .envrc}"
+CONTROLLER_URL="${BROKER_ZT_CONTROLLER_URL:-http://127.0.0.1:9993}"
+TOKEN_PATH="${BROKER_ZT_AUTH_TOKEN_PATH:-/var/lib/zerotier-one/authtoken.secret}"
+
+if ! command -v zerotier-cli >/dev/null 2>&1; then
+    echo "zerotier-cli not found; install with: curl -s https://install.zerotier.com | sudo bash" >&2
+    exit 1
+fi
+
+if ! systemctl is-active --quiet zerotier-one; then
+    echo "Starting zerotier-one"
+    systemctl enable --now zerotier-one
+fi
+
+if [[ ! -r "${TOKEN_PATH}" ]]; then
+    echo "ZeroTier auth token not readable at ${TOKEN_PATH}" >&2
+    exit 1
+fi
+
+TOKEN="$(cat "${TOKEN_PATH}")"
+
+echo "Checking ZeroTier controller status at ${CONTROLLER_URL}"
+curl --silent --show-error --fail \
+    -H "X-ZT1-Auth: ${TOKEN}" \
+    "${CONTROLLER_URL%/}/controller" >/dev/null
+
+echo "Checking network ${BROKER_ZT_NETWORK_ID} exists on this controller"
+if ! curl --silent --show-error --fail \
+        -H "X-ZT1-Auth: ${TOKEN}" \
+        "${CONTROLLER_URL%/}/controller/network/${BROKER_ZT_NETWORK_ID}" >/dev/null; then
+    echo "Network ${BROKER_ZT_NETWORK_ID} is not managed by this controller." >&2
+    echo "Create one with: zerotier-cli net-create" >&2
+    exit 1
+fi
+
+echo "Bootstrap OK."
+echo "  controller: ${CONTROLLER_URL}"
+echo "  network id: ${BROKER_ZT_NETWORK_ID}"
+echo "  node id:    $(zerotier-cli -j info | sed -n 's/.*"address": "\([0-9a-f]*\)".*/\1/p' | head -n1)"

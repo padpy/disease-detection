@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Launch the gopher-eye server locally in a Docker container.
+#
+# Differences from script/docker (which targets the prod host):
+#   - Mounts ./images from the repo instead of /mnt/s3-gopher-eye/images.
+#   - Uses docker compose so the build/run lifecycle is reproducible.
+#   - Creates required bind-mount directories if they're missing.
+#
+# Usage:
+#   ./script/docker-local              # build (if needed) + start in background
+#   ./script/docker-local up           # same as default
+#   ./script/docker-local logs         # tail logs
+#   ./script/docker-local down         # stop + remove container
+#   ./script/docker-local rebuild      # force a fresh image build
+#   ./script/docker-local fg           # run attached (Ctrl-C to stop)
+
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+mkdir -p plants images models trials
+
+if docker compose version >/dev/null 2>&1; then
+    COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+    COMPOSE=(docker-compose)
+else
+    echo "error: 'docker compose' (v2) or 'docker-compose' (v1) is required" >&2
+    exit 1
+fi
+
+cmd="${1:-up}"
+case "$cmd" in
+    up)
+        "${COMPOSE[@]}" up -d --build
+        echo "Server is listening on http://127.0.0.1:5000"
+        ;;
+    fg)
+        "${COMPOSE[@]}" up --build
+        ;;
+    rebuild)
+        "${COMPOSE[@]}" build --no-cache
+        "${COMPOSE[@]}" up -d
+        ;;
+    down|stop)
+        "${COMPOSE[@]}" down
+        ;;
+    logs)
+        "${COMPOSE[@]}" logs -f
+        ;;
+    *)
+        "${COMPOSE[@]}" "$@"
+        ;;
+esac

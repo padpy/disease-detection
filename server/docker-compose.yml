@@ -1,0 +1,18 @@
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gopher-eye-server
+    container_name: gopher-eye-server
+    ports:
+      - "127.0.0.1:5000:5000"
+    volumes:
+      - ./app:/app
+      - ./plants:/app/plants
+      - ./images:/app/images
+      - ./models:/app/models
+      - ./trials:/app/trials
+    environment:
+      ENV: development
+    restart: unless-stopped

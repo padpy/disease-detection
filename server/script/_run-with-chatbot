@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""Launcher for a chatbot-enabled API on a configurable port.
+
+Mirrors app/app.py but lets the port be set via the PORT env var so we can run
+alongside an existing default-port server without disturbing it. Used by the
+LLM smoke test; can also be used standalone:
+
+  GOPHER_EYE_LLM_CKPT=/path/to/ckpt \\
+  GOPHER_EYE_LLM_DIR=/path/to/LLM_work \\
+  PORT=5556 server/script/_run-with-chatbot
+"""
+import os
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+SERVER_DIR = SCRIPT_DIR.parent
+os.chdir(SERVER_DIR)
+sys.path.insert(0, str(SERVER_DIR / "app"))
+
+import uvicorn  # noqa: E402
+from api import create_api  # noqa: E402
+from application import Application  # noqa: E402
+from chatbot import build_chatbot_from_env  # noqa: E402
+from samples_service import SamplesService  # noqa: E402
+from services import SqliteStorageService  # noqa: E402
+
+
+def main() -> int:
+    chatbot = build_chatbot_from_env()
+    if chatbot is None:
+        print("FATAL: GOPHER_EYE_LLM_CKPT not set; chatbot would be disabled",
+              file=sys.stderr, flush=True)
+        return 1
+    print(f"Chatbot configured: ckpt={chatbot.ckpt_dir} (lazy load on first request)",
+          flush=True)
+
+    storage = SqliteStorageService(
+        db_path=os.environ.get("GOPHER_EYE_DB", "data/gopher_eye.sqlite3"),
+    )
+    samples = SamplesService(
+        storage=storage,
+        source_dir=os.environ.get("GOPHER_EYE_SAMPLE_SOURCES", "data/sample_sources"),
+    )
+    app = create_api(
+        "gopher_eye_chatbot_test",
+        Application(storage_service=storage),
+        chatbot=chatbot,
+        samples_service=samples,
+    )
+
+    port = int(os.environ.get("PORT", "5556"))
+    print(f"Listening on 127.0.0.1:{port}", flush=True)
+    uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

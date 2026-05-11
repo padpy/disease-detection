@@ -1,0 +1,20 @@
+services:
+  broker:
+    build: .
+    image: gopher-eye-broker
+    container_name: gopher-eye-broker
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      BROKER_ADMIN_TOKEN: ${BROKER_ADMIN_TOKEN}
+      BROKER_DB_PATH: /data/broker.db
+      BROKER_ZT_NETWORK_ID: ${BROKER_ZT_NETWORK_ID}
+      BROKER_ZT_CONTROLLER_URL: ${BROKER_ZT_CONTROLLER_URL:-http://127.0.0.1:9993}
+      BROKER_ZT_AUTH_TOKEN_PATH: /zt/authtoken.secret
+      BROKER_SERVER_IP: 10.66.66.2
+      BROKER_SUBNET: 10.66.66.0/24
+    volumes:
+      - ./data:/data
+      # Mount the host's ZeroTier auth token so the broker can talk to the
+      # local controller at 127.0.0.1:9993 (we're on host networking).
+      - /var/lib/zerotier-one/authtoken.secret:/zt/authtoken.secret:ro

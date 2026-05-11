@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Start the Gopher Eye FastAPI server (boots uvicorn via app/app.py).
+#
+# Listens on :5555 (macOS) or :5000 (Linux) per app/app.py. Run from anywhere —
+# this script cd's into server/ so model paths like models/leaf-yolo11m-seg.pt
+# resolve correctly. Activate the conda env (gopher-eye-server) yourself before
+# running, or set PYTHON to a python that has the deps installed.
+
+set -euo pipefail
+
+SERVER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$SERVER_DIR"
+
+PYTHON="${PYTHON:-python}"
+
+if [ -f .envrc ] && command -v direnv >/dev/null 2>&1; then
+  eval "$(direnv export bash 2>/dev/null || true)"
+fi
+
+echo "Starting API server from $SERVER_DIR"
+echo "  python: $($PYTHON -V 2>&1)"
+echo "  port:   $([ "$(uname -s)" = "Darwin" ] && echo 5555 || echo 5000)"
+exec "$PYTHON" app/app.py

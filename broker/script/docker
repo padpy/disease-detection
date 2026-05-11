@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+if ! docker image inspect gopher-eye-broker >/dev/null 2>&1; then
+    docker compose build
+fi
+exec docker compose up

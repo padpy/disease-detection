@@ -1,0 +1,12 @@
+httplib2
+httpx
+fastapi
+uvicorn[standard]
+python-multipart
+pillow
+numpy
+pytest
+ultralytics
+SQLAlchemy
+firebase-auth
+transformers

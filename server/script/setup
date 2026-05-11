@@ -1,0 +1,48 @@
+sudo apt update
+sudo apt install -y \
+    git \
+    nginx
+
+##### Install Docker
+# Check if Docker is installed
+if ! command -v docker &> /dev/null
+then
+    echo "Docker not found, installing Docker..."
+    # Add Docker's official GPG key:
+    sudo apt-get update
+    sudo apt-get install -y ca-certificates curl
+    sudo install -m 0755 -d /etc/apt/keyrings
+    sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    sudo chmod a+r /etc/apt/keyrings/docker.asc
+
+    # Add the repository to Apt sources:
+    echo \
+      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
+      $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" | \
+      sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+    sudo apt-get update
+
+    # Install Docker:
+    sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+    # Add the current user to the docker group
+    sudo usermod -aG docker $USER
+
+    # Inform the user to log out and back in
+    echo "Docker installed successfully. Please log out and log back in for the changes to take effect."
+else
+    echo "Docker is already installed"
+fi
+
+# Git clone the gopher-eye-server repo
+git clone https://github.com/AgRobotics-Lab-in-BBE-UMN/gopher-eye-server.git
+cd gopher-eye-server
+git pull
+
+# Copy the nginx config file
+sudo cp /home/ubuntu/gopher-eye-server/server/nginx/available-sites/gopher-eye.com /etc/nginx/sites-available/gopher-eye.com
+sudo ln -s /etc/nginx/sites-available/gopher-eye.com /etc/nginx/sites-enabled/gopher-eye.com
+sudo systemctl restart nginx
+
+# Launch the docker container
+# ./script/docker

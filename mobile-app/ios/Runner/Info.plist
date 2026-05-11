@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CADisableMinimumFrameDurationOnPhone</key>
+	<true/>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleDisplayName</key>
+	<string>Gopher Eye</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>gopher_eye</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(FLUTTER_BUILD_NAME)</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<key>CFBundleVersion</key>
+	<string>$(FLUTTER_BUILD_NUMBER)</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>your usage description here</string>
+	<key>NSLocationAlwaysUsageDescription</key>
+	<string>Gopher Eye tags captured plant samples with their GPS location.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Gopher Eye tags captured plant samples with their GPS location.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>your usage description here</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Gopher Eye shows a preview of your most recent photo and lets you import images from your library as samples.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Gopher Eye saves captured plant samples to your photo library.</string>
+	<key>UIApplicationSupportsIndirectInputEvents</key>
+	<true/>
+	<key>UILaunchStoryboardName</key>
+	<string>LaunchScreen</string>
+	<key>UIMainStoryboardFile</key>
+	<string>Main</string>
+	<key>UIStatusBarStyle</key>
+	<string></string>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+	<!--
+	  Google Sign-In requires this URL scheme so iOS can hand control back
+	  to the app after the OAuth round-trip in Safari/ASWebAuthenticationSession.
+
+	  Replace REVERSED_CLIENT_ID below with the value of the same key from
+	  ios/Runner/GoogleService-Info.plist (looks like
+	  "com.googleusercontent.apps.123456789-abcdefg"). If GoogleService-Info.plist
+	  is regenerated, update this value to match.
+
+	  This block can be removed entirely if Google Sign-In is disabled in
+	  Firebase Console and the corresponding button is removed from
+	  lib/screens/sign_in_screen.dart.
+	-->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>REVERSED_CLIENT_ID</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

@@ -1,0 +1,11 @@
+plants
+images
+test-images
+test-plants
+.vscode
+.pytest_cache
+__pycache__
+.DS_Store
+scratch
+models
+models.server

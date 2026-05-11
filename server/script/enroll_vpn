@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+#
+# Enroll this application-server host as the `server` peer of the ZeroTier
+# broker.
+#
+# Env requirements (typically set by server/.envrc):
+#   BROKER_URL              e.g. https://broker.example.com:8080
+#   BROKER_ADMIN_TOKEN      shared secret with broker/.envrc
+#
+# This script needs zerotier-one installed locally; the broker tells it which
+# network to join, and we hand the broker the local node id so it can authorize
+# us on that network.
+#
+# Idempotent: re-running is a no-op when the host is already enrolled.
+
+set -euo pipefail
+
+if [[ $EUID -ne 0 ]]; then
+    echo "Run as root (sudo)." >&2
+    exit 1
+fi
+
+: "${BROKER_URL:?must be set}"
+: "${BROKER_ADMIN_TOKEN:?must be set}"
+
+if ! command -v zerotier-cli >/dev/null 2>&1; then
+    echo "zerotier-cli not found; install with: curl -s https://install.zerotier.com | sudo bash" >&2
+    exit 1
+fi
+
+if ! systemctl is-active --quiet zerotier-one; then
+    systemctl enable --now zerotier-one
+fi
+
+NODE_ID="$(zerotier-cli -j info | sed -n 's/.*"address": "\([0-9a-f]*\)".*/\1/p' | head -n1)"
+if [[ -z "${NODE_ID}" ]]; then
+    echo "Could not read this host's ZeroTier node id; is zerotier-one running?" >&2
+    exit 1
+fi
+
+echo "Registering this host as peer 'server' (node id ${NODE_ID}) with broker ${BROKER_URL}"
+response="$(
+    curl --silent --show-error --fail \
+        -X POST \
+        -H "X-Broker-Token: ${BROKER_ADMIN_TOKEN}" \
+        -H "Content-Type: application/json" \
+        --data "$(printf '{"peer_id":"server","kind":"server","node_id":"%s"}' "${NODE_ID}")" \
+        "${BROKER_URL%/}/admin/peers"
+)"
+
+# Crude JSON field extraction: avoids needing jq on the host.
+field() { printf '%s' "$response" | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['$1'])"; }
+
+NETWORK_ID="$(field network_id)"
+ASSIGNED_IP="$(field assigned_ip)"
+
+echo "Broker assigned ${ASSIGNED_IP} on network ${NETWORK_ID}"
+echo "Joining ZeroTier network ${NETWORK_ID}"
+zerotier-cli join "${NETWORK_ID}" >/dev/null
+
+# Wait for the controller (i.e. the broker's reconciler) to authorize us. This
+# usually takes a second or two; cap at 30s to fail loudly if anything's off.
+for _ in $(seq 1 30); do
+    if zerotier-cli -j listnetworks \
+            | grep -A1 "\"${NETWORK_ID}\"" \
+            | grep -q '"status": "OK"'; then
+        echo "Enrollment complete. zerotier-cli listnetworks:"
+        zerotier-cli listnetworks
+        exit 0
+    fi
+    sleep 1
+done
+
+echo "Joined ${NETWORK_ID} but did not reach status=OK within 30s; check broker logs." >&2
+zerotier-cli listnetworks >&2
+exit 1

@@ -1,0 +1,21 @@
+# Copy to .envrc and fill in real values. .envrc is gitignored.
+
+# Shared secret with server/.envrc — gates the admin API.
+export BROKER_ADMIN_TOKEN="change-me-to-a-long-random-string"
+
+# The ZeroTier network this broker controls (16 hex chars). The default
+# below is the network the mobile app pre-fills with; replace if you mint
+# a fresh controller-managed network.
+export BROKER_ZT_NETWORK_ID="6ab565387a1297b5"
+
+# Local ZeroTier controller endpoint and admin token.
+# BROKER_ZT_AUTH_TOKEN_PATH is read at startup if BROKER_ZT_AUTH_TOKEN is unset.
+export BROKER_ZT_CONTROLLER_URL="http://127.0.0.1:9993"
+export BROKER_ZT_AUTH_TOKEN_PATH="/var/lib/zerotier-one/authtoken.secret"
+
+# Local SQLite path for the peer registry.
+export BROKER_DB_PATH="./data/broker.db"
+
+# Address inside the network reserved for the Flask server peer.
+export BROKER_SERVER_IP="10.66.66.2"
+export BROKER_SUBNET="10.66.66.0/24"

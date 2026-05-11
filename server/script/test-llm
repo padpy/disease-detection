@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""Send a chat completion to the OpenAI-compatible /v1/chat/completions endpoint.
+
+The Gopher Eye LLM is multimodal — every request must include at least one
+user message with an ``image_url`` content part. This script encodes a local
+image as a ``data:`` URI and sends a single-turn prompt. Streaming is not
+supported by the server (returns 400), so this client is non-streaming.
+
+Usage:
+  script/test-llm                                # default grape leaf + prompt
+  script/test-llm path/to/leaf.jpg
+  script/test-llm path/to/leaf.jpg -p "Diagnose this leaf."
+  script/test-llm --host http://other-host:5555 --model gopher-eye-grape-leaf
+
+The script first hits /v1/models. If the server returns 503 with
+``chatbot is not configured``, set GOPHER_EYE_LLM_CKPT (and GOPHER_EYE_LLM_DIR)
+before starting the API.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import mimetypes
+import platform
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+SERVER_DIR = SCRIPT_DIR.parent
+REPO_ROOT = SERVER_DIR.parent
+DEFAULT_IMAGE = REPO_ROOT / "LLM_work" / "how_to_use" / "ex_image.jpg"
+DEFAULT_PORT = 5555 if platform.system() == "Darwin" else 5000
+DEFAULT_HOST = f"http://localhost:{DEFAULT_PORT}"
+DEFAULT_MODEL = "gopher-eye-grape-leaf"
+DEFAULT_PROMPT = (
+    "You are a plant pathologist. Examine this grape leaf image and report any "
+    "visible disease (Healthy / Downy Mildew / Powdery Mildew) with one short "
+    "supporting sentence."
+)
+
+
+def post_json(url: str, payload: dict, timeout: float = 600.0) -> tuple[int, dict | str]:
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json", "Content-Length": str(len(body))},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as err:
+        raw = err.read().decode("utf-8", errors="replace")
+        try:
+            return err.code, json.loads(raw)
+        except json.JSONDecodeError:
+            return err.code, raw
+
+
+def get_json(url: str, timeout: float = 30.0) -> tuple[int, dict | str]:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as err:
+        raw = err.read().decode("utf-8", errors="replace")
+        try:
+            return err.code, json.loads(raw)
+        except json.JSONDecodeError:
+            return err.code, raw
+
+
+def encode_image_data_uri(image_path: Path) -> str:
+    mime = mimetypes.guess_type(image_path.name)[0] or "image/jpeg"
+    b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("image", nargs="?", default=str(DEFAULT_IMAGE),
+                        help=f"path to image (default: {DEFAULT_IMAGE})")
+    parser.add_argument("-p", "--prompt", default=DEFAULT_PROMPT,
+                        help="user prompt to send alongside the image")
+    parser.add_argument("--host", default=DEFAULT_HOST,
+                        help=f"server base URL (default: {DEFAULT_HOST})")
+    parser.add_argument("--model", default=DEFAULT_MODEL,
+                        help=f"model id (default: {DEFAULT_MODEL})")
+    parser.add_argument("--max-tokens", type=int, default=256,
+                        help="max_completion_tokens (default: 256)")
+    parser.add_argument("--temperature", type=float, default=0.1,
+                        help="sampling temperature (default: 0.1; 0 = greedy)")
+    parser.add_argument("--raw", action="store_true",
+                        help="print the raw OpenAI-style JSON response")
+    args = parser.parse_args()
+
+    image_path = Path(args.image).expanduser().resolve()
+    if not image_path.is_file():
+        print(f"error: image not found: {image_path}", file=sys.stderr)
+        return 2
+
+    host = args.host.rstrip("/")
+
+    # 1. /v1/models — verify the chatbot is configured
+    code, models = get_json(f"{host}/v1/models")
+    if code != 200:
+        msg = models.get("error", {}).get("message") if isinstance(models, dict) else models
+        print(f"error: GET /v1/models returned {code}: {msg}", file=sys.stderr)
+        if code == 503:
+            print("hint: set GOPHER_EYE_LLM_CKPT (and GOPHER_EYE_LLM_DIR) before "
+                  "starting the API to enable the chatbot.", file=sys.stderr)
+        return 1
+    listed = ", ".join(m.get("id", "?") for m in models.get("data", [])) or "(none)"
+    print(f"server up at {host}; models: {listed}")
+
+    # 2. /v1/chat/completions — multimodal request
+    data_uri = encode_image_data_uri(image_path)
+    payload = {
+        "model": args.model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": args.prompt},
+                    {"type": "image_url", "image_url": {"url": data_uri}},
+                ],
+            }
+        ],
+        "max_completion_tokens": args.max_tokens,
+        "temperature": args.temperature,
+        "stream": False,
+    }
+    print(f"sending {image_path.name} ({image_path.stat().st_size} bytes) "
+          f"with prompt: {args.prompt!r}")
+    code, body = post_json(f"{host}/v1/chat/completions", payload)
+
+    if code != 200:
+        if isinstance(body, dict):
+            err = body.get("error", {})
+            print(f"error: POST /v1/chat/completions returned {code}: "
+                  f"{err.get('message', body)}", file=sys.stderr)
+        else:
+            print(f"error: POST /v1/chat/completions returned {code}: {body}",
+                  file=sys.stderr)
+        return 1
+
+    if args.raw:
+        print(json.dumps(body, indent=2))
+        return 0
+
+    choices = body.get("choices") or []
+    if not choices:
+        print("error: response had no choices", file=sys.stderr)
+        print(json.dumps(body, indent=2))
+        return 1
+
+    msg = choices[0].get("message", {})
+    content = msg.get("content", "")
+    finish_reason = choices[0].get("finish_reason")
+    usage = body.get("usage", {})
+
+    print()
+    print(f"--- assistant ({body.get('model', args.model)}) ---")
+    print(content.strip() or "(empty response)")
+    print(f"--- finish_reason: {finish_reason} ---")
+    print(f"usage: prompt={usage.get('prompt_tokens')} "
+          f"completion={usage.get('completion_tokens')} "
+          f"total={usage.get('total_tokens')}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

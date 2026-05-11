@@ -1,0 +1,58 @@
+name: gopher_eye
+description: "Gopher Eye plant disease detection."
+publish_to: "none"
+
+version: 0.2.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.6
+  camera: ^0.10.5
+  permission_handler: ^8.3.0
+  sqflite: ^2.3.3
+  path: ^1.9.0
+  path_provider: ^2.1.4
+  geolocator: ^11.0.0
+  gal: ^2.3.0
+  url_launcher: ^6.3.0
+  image_picker: ^1.1.2
+  photo_manager: ^3.0.0
+  onnxruntime_v2: ^1.23.2
+  image: ^4.1.0
+  shared_preferences: ^2.2.0
+  http: ^1.2.0
+  firebase_core: ^3.6.0
+  firebase_auth: ^5.3.1
+  google_sign_in: ^6.2.1
+  sign_in_with_apple: ^6.1.2
+  crypto: ^3.0.3
+  langchain: ^0.7.0
+  langchain_openai: ^0.7.0
+  mobile_scanner: ^7.2.0
+  qr_flutter: ^4.1.0
+  archive: ^4.0.0
+  share_plus: ^10.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+  flutter_launcher_icons: ^0.14.3
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/icons/
+    - assets/images/
+    - assets/models/
+
+flutter_launcher_icons:
+  android: "launcher_icon"
+  ios: true
+  image_path: "assets/icons/app_store_1.png"
+  min_sdk_android: 21

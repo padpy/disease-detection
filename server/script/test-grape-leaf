@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""Send a grape leaf image to the running API server and print the result.
+
+Round trip:
+  PUT /dl/segmentation        upload image, get plant_id
+  GET /plant/status?plant_id  poll until "complete"
+  GET /plant/data?plant_id    fetch boxes + labels (Healthy/Downy/Powdery-Leaf)
+
+Usage:
+  script/test-grape-leaf [IMAGE] [--host URL]
+
+Defaults: IMAGE = repo's LLM_work/how_to_use/ex_image.jpg, host = localhost:5555
+on macOS / localhost:5000 elsewhere.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import mimetypes
+import os
+import platform
+import sys
+import time
+import urllib.request
+import urllib.parse
+import uuid
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+SERVER_DIR = SCRIPT_DIR.parent
+REPO_ROOT = SERVER_DIR.parent
+DEFAULT_IMAGE = REPO_ROOT / "LLM_work" / "how_to_use" / "ex_image.jpg"
+DEFAULT_PORT = 5555 if platform.system() == "Darwin" else 5000
+DEFAULT_HOST = f"http://localhost:{DEFAULT_PORT}"
+
+POLL_INTERVAL_S = 1.0
+POLL_TIMEOUT_S = 120.0
+
+
+def put_multipart(url: str, image_path: Path) -> dict:
+    """PUT image_path to url as multipart/form-data with field name 'image'."""
+    boundary = f"----GopherEyeBoundary{uuid.uuid4().hex}"
+    mime = mimetypes.guess_type(image_path.name)[0] or "image/jpeg"
+    with image_path.open("rb") as f:
+        image_bytes = f.read()
+
+    body = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="image"; filename="{image_path.name}"\r\n'
+        f"Content-Type: {mime}\r\n\r\n"
+    ).encode("utf-8") + image_bytes + f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="PUT",
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Length": str(len(body)),
+        },
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def get_json(url: str) -> dict:
+    with urllib.request.urlopen(url, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("image", nargs="?", default=str(DEFAULT_IMAGE),
+                        help=f"path to grape leaf image (default: {DEFAULT_IMAGE})")
+    parser.add_argument("--host", default=DEFAULT_HOST,
+                        help=f"server base URL (default: {DEFAULT_HOST})")
+    args = parser.parse_args()
+
+    image_path = Path(args.image).expanduser().resolve()
+    if not image_path.is_file():
+        print(f"error: image not found: {image_path}", file=sys.stderr)
+        return 2
+
+    host = args.host.rstrip("/")
+
+    try:
+        status = get_json(f"{host}/status")
+        print(f"server up at {host}: {status}")
+    except Exception as err:
+        print(f"error: cannot reach {host}/status — is the API server running?\n  {err}",
+              file=sys.stderr)
+        return 1
+
+    print(f"uploading {image_path} ({image_path.stat().st_size} bytes)...")
+    upload = put_multipart(f"{host}/dl/segmentation", image_path)
+    plant_id = upload.get("plant_id")
+    if not plant_id:
+        print(f"error: upload did not return a plant_id: {upload}", file=sys.stderr)
+        return 1
+    print(f"plant_id: {plant_id}")
+
+    qs = urllib.parse.urlencode({"plant_id": plant_id})
+    deadline = time.monotonic() + POLL_TIMEOUT_S
+    last_status = None
+    while time.monotonic() < deadline:
+        s = get_json(f"{host}/plant/status?{qs}").get("status")
+        if s != last_status:
+            print(f"  status: {s}")
+            last_status = s
+        if s == "complete":
+            break
+        time.sleep(POLL_INTERVAL_S)
+    else:
+        print(f"error: timed out after {POLL_TIMEOUT_S:.0f}s waiting for completion",
+              file=sys.stderr)
+        return 1
+
+    data = get_json(f"{host}/plant/data?{qs}")
+    labels = data.get("labels") or []
+    boxes = data.get("bounding_boxes") or []
+    print(f"detections: {len(boxes)} leaf instance(s)")
+    for i, label in enumerate(labels):
+        print(f"  [{i}] {label}")
+
+    print("\nfull response:")
+    print(json.dumps(data, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
