@@ -6,13 +6,15 @@ services:
     image: gopher-eye-server
     container_name: gopher-eye-server
     ports:
-      - "5000:5000"
+      - "10.0.1.10:5000:5000"
     volumes:
       - ./app:/app
       - ./plants:/app/plants
       - ./images:/app/images
       - ./models:/app/models
       - ./trials:/app/trials
+      - ./runs:/app/runs:ro
+      - /home/nickp/development/grape/hf-models:/home/nickp/development/grape/hf-models:ro
     environment:
       ENV: development
     restart: unless-stopped
