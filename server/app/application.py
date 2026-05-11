@@ -10,8 +10,14 @@ import cv2
 from scipy import ndimage
 
 from services import StorageService, SqliteStorageService
-from tiled_yolo import tiled_detect, TILE_SIZE, TILE_STRIDE
-from sam_segmenter import SamSegmenter
+from tiled_yolo import (
+    tiled_detect,
+    pack_into_crops,
+    TILE_SIZE,
+    TILE_STRIDE,
+    CROP_BBOX_PADDING,
+)
+from sam_segmenter import SAM_INPUT_SIZE, SamSegmenter
 
 LEAF_MODEL = "models/leaf-yolo11m-seg.pt"
 SPIKE_MODEL = "models/spike-yolo11x-seg.pt"
@@ -148,16 +154,23 @@ class Application(ApplicationInterface):
     def _segment_from_detections(self, image, detections):
         """Produce one binary mask per detection.
 
-        Uses SAM with the box centroid as a foreground point prompt
-        (plus the bbox as a box prompt — both help SAM lock onto the
-        instance instead of bleeding into neighbours). If SAM isn't
-        loaded, falls back to a rectangular mask over the bbox so the
-        rest of the pipeline still has something to crop against.
+        Detections are packed into ~1024×1024 image crops (matching the
+        SAM encoder's native input size) so we encode at the model's
+        actual receptive field instead of a downscaled global view.
+        Each crop is sized so it fully contains every assigned
+        detection's padded bbox — that margin prevents clipping the
+        spike's full extent (e.g. awns past the YOLO box) before SAM
+        ever sees it. The encoder runs once per crop; the decoder runs
+        once per detection within that crop.
+
+        Falls back to rectangular masks over the bbox if SAM isn't
+        loaded, so the rest of the pipeline still has something to
+        crop against.
         """
         if not detections:
             return []
+        h, w = image.shape[:2]
         if self.sam is None:
-            h, w = image.shape[:2]
             fallback = []
             for d in detections:
                 m = np.zeros((h, w), dtype=np.uint8)
@@ -167,19 +180,42 @@ class Application(ApplicationInterface):
                 fallback.append(m)
             return fallback
 
-        embedding, letterbox = self.sam.encode(image)
-        masks = []
-        for d in detections:
-            cx, cy = d.centroid
-            mask = self.sam.predict(
-                embedding=embedding,
-                letterbox=letterbox,
-                points=[(cx, cy)],
-                point_labels=[1],
-                bbox=d.xyxy,
-            )
-            masks.append(mask)
-        return masks
+        # Pack the post-NMS detections into crops of the SAM input size.
+        # `mask_by_detection` keys are `id(detection)` so the original
+        # order of `detections` is preserved on the way out.
+        crops = pack_into_crops(
+            detections,
+            image_w=w,
+            image_h=h,
+            crop_size=SAM_INPUT_SIZE,
+            bbox_padding=CROP_BBOX_PADDING,
+        )
+        mask_by_detection: dict[int, np.ndarray] = {}
+
+        for (x0, y0, x1, y1), members in crops:
+            crop_img = image[y0:y1, x0:x1]
+            ch, cw = crop_img.shape[:2]
+            embedding, letterbox = self.sam.encode(crop_img)
+            for d in members:
+                # Translate prompts into crop-local coords; SAM emits a
+                # mask at `crop_img` resolution, which we then paste
+                # back into a full-image-sized zero buffer.
+                cx, cy = d.centroid
+                local_centroid = (cx - x0, cy - y0)
+                local_bbox = (d.x1 - x0, d.y1 - y0,
+                              d.x2 - x0, d.y2 - y0)
+                local_mask = self.sam.predict(
+                    embedding=embedding,
+                    letterbox=letterbox,
+                    points=[local_centroid],
+                    point_labels=[1],
+                    bbox=local_bbox,
+                )
+                full = np.zeros((h, w), dtype=np.uint8)
+                full[y0:y0 + ch, x0:x0 + cw] = local_mask
+                mask_by_detection[id(d)] = full
+
+        return [mask_by_detection[id(d)] for d in detections]
 
     @staticmethod
     def _mask_to_normalised_polygon(mask, width, height):

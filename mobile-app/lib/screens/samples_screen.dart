@@ -872,6 +872,12 @@ class _SampleViewerScreenState extends State<SampleViewerScreen> {
       setState(() {
         _instances = analyzed.instances;
         _diseaseOverlayPng = analyzed.overlayPng;
+        // Disease analysis may have mutated the spike masks (Stage 4 cleanup);
+        // prefer the cleaned overlay it returns over the pre-cleanup one we
+        // showed during the rebuild step above.
+        if (analyzed.segmentationOverlayPng != null) {
+          _segmentationOverlayPng = analyzed.segmentationOverlayPng;
+        }
       });
     } catch (e, st) {
       debugPrint('[refresh] post-edit refresh failed: $e\n$st');

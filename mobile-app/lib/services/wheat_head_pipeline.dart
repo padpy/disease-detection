@@ -353,6 +353,24 @@ class WheatHeadPipeline {
     );
   }
 
+  /// Post-analysis spike-mask refinement (wheat only): drops tiny "other"
+  /// specks from the spike mask + classification so the segmentation outline
+  /// users see in "Segment" mode stops covering bits of background that the
+  /// HSV gate flagged as neither green nor necrotic. Mutates [mask] and
+  /// `report.classification` in place; returns a new [FhbReport] with the
+  /// recomputed counts/ratio derived from the refined state.
+  Future<FhbReport> refineDisease({
+    required FhbReport report,
+    required Uint8List mask,
+    required Rect bbox,
+  }) async {
+    return FhbAnalyzer.instance.refineMaskFromReport(
+      report: report,
+      spikeMask: mask,
+      bbox: bbox,
+    );
+  }
+
   /// Renders a per-instance disease preview tile: cropped from [source] (so
   /// the tile is at the source image's pixel density — typically the full
   /// resolution capture) with each pixel tinted according to the

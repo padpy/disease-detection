@@ -599,8 +599,12 @@ class DetectionService extends ChangeNotifier {
   /// crisp tiles. When null we fall back to decoding the working image,
   /// which keeps callers (e.g. the viewer's post-edit refresh) from having
   /// to read the original JPEG every time.
-  Future<({List<SampleInstance> instances, Uint8List? overlayPng})>
-      runDiseaseAnalysis({
+  Future<
+      ({
+        List<SampleInstance> instances,
+        Uint8List? overlayPng,
+        Uint8List? segmentationOverlayPng,
+      })> runDiseaseAnalysis({
     required DetectionMode mode,
     required Uint8List workingPng,
     required int workingW,
@@ -616,6 +620,7 @@ class DetectionService extends ChangeNotifier {
     final previewSource = sourceOverride ?? workingImage;
     final reports = <FhbReport>[];
     final updated = <SampleInstance>[];
+    final segMaskRefs = <({Uint8List mask, int width, int height})>[];
     for (int i = 0; i < instances.length; i++) {
       final inst = instances[i];
       if (inst.imageWidth != workingW || inst.imageHeight != workingH) {
@@ -624,7 +629,7 @@ class DetectionService extends ChangeNotifier {
         continue;
       }
       final mask = pipe.decodeMaskPng(inst.maskPng).mask;
-      final report = switch (mode) {
+      var report = switch (mode) {
         DetectionMode.wheatFhb => await pipe.analyzeDisease(
             workingImage: workingImage,
             mask: mask,
@@ -641,13 +646,38 @@ class DetectionService extends ChangeNotifier {
             bbox: inst.bbox,
           ),
       };
+      // Post-analysis refinement (wheat only): drop tiny "other" specks from
+      // the spike mask + classification so the segmentation outline users
+      // see in "Segment" mode matches what the disease counts were derived
+      // from. Mutates `mask` and the report's classification in place.
+      if (mode == DetectionMode.wheatFhb) {
+        report = await pipe.refineDisease(
+          report: report,
+          mask: mask,
+          bbox: inst.bbox,
+        );
+      }
       reports.add(report);
       final diseasePreview = pipe.renderDiseasePreview(
         source: previewSource,
         report: report,
         bbox: inst.bbox,
       );
+      // Persist the post-refinement mask so the segmentation overlay + the
+      // per-instance preview tile reflect the cleanup. Grape skips refine,
+      // so its `mask` is unchanged and the re-encode is effectively a no-op.
+      final updatedMaskPng = pipe.encodeMaskPng(mask, workingW, workingH);
+      final updatedPreviewPng = pipe.renderInstancePreview(
+        source: previewSource,
+        mask: mask,
+        maskWidth: workingW,
+        maskHeight: workingH,
+        bbox: inst.bbox,
+      );
+      segMaskRefs.add((mask: mask, width: workingW, height: workingH));
       final enriched = inst.copyWith(
+        maskPng: updatedMaskPng,
+        previewPng: updatedPreviewPng,
         fhbGreenCount: report.greenCount,
         fhbNecroticCount: report.necroticCount,
         fhbOtherCount: report.otherCount,
@@ -673,7 +703,21 @@ class DetectionService extends ChangeNotifier {
       );
     }
     await repo.saveDiseaseOverlay(sampleId: sampleId, png: overlayPng);
-    return (instances: updated, overlayPng: overlayPng);
+    Uint8List? segOverlayPng;
+    if (segMaskRefs.isNotEmpty) {
+      segOverlayPng = pipe.renderCombinedSegmentationOverlay(
+        width: workingW,
+        height: workingH,
+        masks: segMaskRefs,
+      );
+      await repo.saveSegmentationOverlay(
+          sampleId: sampleId, png: segOverlayPng);
+    }
+    return (
+      instances: updated,
+      overlayPng: overlayPng,
+      segmentationOverlayPng: segOverlayPng,
+    );
   }
 }
 

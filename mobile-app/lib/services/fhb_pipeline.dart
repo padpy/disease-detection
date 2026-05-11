@@ -75,6 +75,12 @@ class FhbReport {
 /// Runs the FHB disease-detection sub-pipeline (HSV classification → healthy
 /// closure → small-contour filter) used by the FHB notebook on a single
 /// segmentation instance.
+///
+/// [analyze] is pure — it never mutates the supplied [spikeMask]. The
+/// mask refinement (dropping every "other" pixel from the spike mask so the
+/// segmentation overlay covers only the classified green/necrotic area) is
+/// exposed as a separate step via [refineMaskFromReport], which callers run
+/// **after** analysis when they want the refined mask persisted.
 class FhbAnalyzer {
   const FhbAnalyzer();
 
@@ -86,13 +92,6 @@ class FhbAnalyzer {
   /// FHB connected components below `total_mask_pixels * _kMinNecroFraction`
   /// are reclassified as healthy. The user spec asked for 1/32.
   static const double _kMinNecroFraction = 1 / 32;
-
-  /// Closure radius applied to the "other" mask before dropping tiny bodies.
-  static const int _kOtherClosureRadius = 3;
-
-  /// Connected components of "other" pixels below this size are removed
-  /// from the spike mask after the closure consolidates nearby specks.
-  static const int _kOtherMinArea = 10;
 
   FhbReport analyze({
     required img.Image workingImage,
@@ -204,25 +203,10 @@ class FhbAnalyzer {
       replacementClass: kClassGreen,
     );
 
-    // ---------- Stage 4: drop tiny "other" bodies from the mask ----------
-    // Detect "other" pixels, run a 3-px closure to consolidate nearby
-    // specks, then remove connected components smaller than 10 px by
-    // reclassifying them to `outside` so they fall out of the recount.
-    removeSmallOtherComponents(
-      classification: classification,
-      instanceMask: spikeMask,
-      width: maskWidth,
-      height: maskHeight,
-      x0: x0,
-      y0: y0,
-      x1: x1,
-      y1: y1,
-      closureRadius: _kOtherClosureRadius,
-      minArea: _kOtherMinArea,
-    );
-
-    // Recount after morphology — counts above are pre-cleanup, and Stage 4
-    // may have removed pixels from the spike entirely (kClassOutside).
+    // Recount after Stage 3 — the contour filter reclassifies necrotic ↔
+    // green so the initial Stage 1 counts are stale here. The "other" count
+    // is computed for the first time at this point. No mask mutation has
+    // happened yet; that's deferred to [refineMaskFromReport].
     totalPixels = 0;
     greenCount = 0;
     necroticCount = 0;
@@ -232,10 +216,8 @@ class FhbAnalyzer {
       for (int x = x0; x < x1; x++) {
         final i = row + x;
         if (spikeMask[i] == 0) continue;
-        final cls = classification[i];
-        if (cls == kClassOutside) continue;
         totalPixels++;
-        switch (cls) {
+        switch (classification[i]) {
           case kClassGreen:
             greenCount++;
             break;
@@ -259,6 +241,74 @@ class FhbAnalyzer {
       totalPixels: totalPixels,
       fhbRatio: fhbRatio,
       severity: severity,
+      classification: classification,
+      maskWidth: maskWidth,
+      maskHeight: maskHeight,
+    );
+  }
+
+  /// Post-analysis spike-mask refinement: drops **every** `kClassOther` pixel
+  /// from the spike mask (and from [report]'s classification map) so the
+  /// segmentation outline users see in "Segment" mode covers only the
+  /// classified green/necrotic spike area — never the yellow "other" regions
+  /// that the HSV gate flagged as neither healthy nor diseased.
+  ///
+  /// Run by callers after [analyze] when they want the cleaned mask
+  /// persisted; counts/ratio are recomputed from the refined state and
+  /// returned in a new [FhbReport] (`otherCount` is always 0 after this).
+  ///
+  /// **Mutates both [spikeMask] and `report.classification` in place.** The
+  /// returned report shares the same classification buffer; the old report
+  /// becomes stale after this call.
+  FhbReport refineMaskFromReport({
+    required FhbReport report,
+    required Uint8List spikeMask,
+    required Rect bbox,
+  }) {
+    final maskWidth = report.maskWidth;
+    final maskHeight = report.maskHeight;
+    final classification = report.classification;
+    final x0 = bbox.left.floor().clamp(0, maskWidth - 1);
+    final y0 = bbox.top.floor().clamp(0, maskHeight - 1);
+    final x1 = bbox.right.ceil().clamp(x0 + 1, maskWidth);
+    final y1 = bbox.bottom.ceil().clamp(y0 + 1, maskHeight);
+
+    int totalPixels = 0;
+    int greenCount = 0;
+    int necroticCount = 0;
+    for (int y = y0; y < y1; y++) {
+      final row = y * maskWidth;
+      for (int x = x0; x < x1; x++) {
+        final i = row + x;
+        if (spikeMask[i] == 0) continue;
+        final cls = classification[i];
+        if (cls == kClassOther) {
+          // Drop from both the segmentation mask and the classification so
+          // the green outline and the yellow disease tint disappear together.
+          classification[i] = kClassOutside;
+          spikeMask[i] = 0;
+          continue;
+        }
+        totalPixels++;
+        switch (cls) {
+          case kClassGreen:
+            greenCount++;
+            break;
+          case kClassNecrotic:
+            necroticCount++;
+            break;
+        }
+      }
+    }
+    final denom = greenCount + necroticCount;
+    final fhbRatio = denom == 0 ? 0.0 : necroticCount / denom;
+    return FhbReport(
+      greenCount: greenCount,
+      necroticCount: necroticCount,
+      otherCount: 0,
+      totalPixels: totalPixels,
+      fhbRatio: fhbRatio,
+      severity: _severityFor(fhbRatio),
       classification: classification,
       maskWidth: maskWidth,
       maskHeight: maskHeight,

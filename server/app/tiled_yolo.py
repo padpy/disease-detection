@@ -105,6 +105,120 @@ def nms(detections: Sequence[Detection], iou_thresh: float = 0.5) -> List[Detect
     return [detections[i] for i in kept]
 
 
+CROP_BBOX_PADDING = 32
+
+
+def pack_into_crops(
+    detections: Sequence[Detection],
+    image_w: int,
+    image_h: int,
+    crop_size: int = 1024,
+    bbox_padding: int = CROP_BBOX_PADDING,
+) -> List[tuple[tuple[int, int, int, int], List[Detection]]]:
+    """Group detections into ``crop_size × crop_size`` windows so SAM
+    sees each instance at native resolution instead of a global
+    downscale.
+
+    Each crop is guaranteed to fully contain the padded bbox of every
+    detection assigned to it — `bbox_padding` extra pixels on every side
+    of the YOLO box. That margin is the whole point of this step:
+    YOLO's spike-head boxes are often tight on the kernel cluster and
+    don't include the awns, so a tight crop would clip the structure
+    SAM needs to see to draw a correct mask.
+
+    Greedy clustering: pick the highest-scoring uncovered detection as
+    an anchor, iteratively absorb other detections whose padded bbox
+    can co-exist with the anchor's inside a single `crop_size` window,
+    place the window centred on that union (clamped to image bounds
+    while still containing the union), then drop the included
+    detections and repeat.
+
+    Returns a list of `((x0, y0, x1, y1), detections_in_window)` tuples.
+    Each detection appears in exactly one window. Windows may overlap —
+    that's fine, SAM runs independently on each.
+    """
+    if not detections:
+        return []
+
+    def padded(d: Detection) -> tuple[float, float, float, float]:
+        return (
+            d.x1 - bbox_padding,
+            d.y1 - bbox_padding,
+            d.x2 + bbox_padding,
+            d.y2 + bbox_padding,
+        )
+
+    # If the image already fits inside one crop, one window covers it all.
+    if image_w <= crop_size and image_h <= crop_size:
+        return [((0, 0, image_w, image_h), list(detections))]
+
+    uncovered = sorted(detections, key=lambda d: -d.score)
+    crops: List[tuple[tuple[int, int, int, int], List[Detection]]] = []
+
+    while uncovered:
+        anchor = uncovered[0]
+        ax1, ay1, ax2, ay2 = padded(anchor)
+        # Grow the cluster greedily: a candidate joins iff the union of
+        # padded bboxes still fits inside one crop_size window in both
+        # axes. Iterating uncovered in score order means we prefer to
+        # group with the next-best detections.
+        ux1, uy1, ux2, uy2 = ax1, ay1, ax2, ay2
+        cluster = [anchor]
+        for d in uncovered[1:]:
+            dx1, dy1, dx2, dy2 = padded(d)
+            new_ux1 = min(ux1, dx1)
+            new_uy1 = min(uy1, dy1)
+            new_ux2 = max(ux2, dx2)
+            new_uy2 = max(uy2, dy2)
+            if (new_ux2 - new_ux1) <= crop_size and (new_uy2 - new_uy1) <= crop_size:
+                ux1, uy1, ux2, uy2 = new_ux1, new_uy1, new_ux2, new_uy2
+                cluster.append(d)
+
+        # Centre the window on the union, then clamp so it (a) still
+        # contains the union and (b) doesn't run off the image. The
+        # union/window arithmetic uses image-space pixel coords.
+        center_x = (ux1 + ux2) / 2.0
+        center_y = (uy1 + uy2) / 2.0
+        x0 = int(round(center_x - crop_size / 2.0))
+        y0 = int(round(center_y - crop_size / 2.0))
+
+        if image_w <= crop_size:
+            x0, x1 = 0, image_w
+        else:
+            # Keep the union inside the window: x0 must satisfy
+            #   x0 <= ux1   and   x0 + crop >= ux2
+            x0 = max(int(np.ceil(ux2 - crop_size)), x0)
+            x0 = min(int(np.floor(ux1)), x0)
+            x0 = max(0, min(image_w - crop_size, x0))
+            x1 = x0 + crop_size
+
+        if image_h <= crop_size:
+            y0, y1 = 0, image_h
+        else:
+            y0 = max(int(np.ceil(uy2 - crop_size)), y0)
+            y0 = min(int(np.floor(uy1)), y0)
+            y0 = max(0, min(image_h - crop_size, y0))
+            y1 = y0 + crop_size
+
+        # Final membership check uses the actual window — clamping above
+        # is conservative but we still want to be precise about who is in.
+        inside = []
+        for d in uncovered:
+            dx1, dy1, dx2, dy2 = padded(d)
+            if dx1 >= x0 and dy1 >= y0 and dx2 <= x1 and dy2 <= y1:
+                inside.append(d)
+        if not inside:
+            # Anchor's padded bbox is bigger than `crop_size` (rare — only
+            # when a single detection is huge). Take it alone; SAM will
+            # still see the clipped padded region.
+            inside = [anchor]
+
+        crops.append(((x0, y0, x1, y1), inside))
+        covered = {id(d) for d in inside}
+        uncovered = [d for d in uncovered if id(d) not in covered]
+    return crops
+
+
 def tiled_detect(
     image: np.ndarray,
     model,
