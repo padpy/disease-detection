@@ -10,9 +10,13 @@ import cv2
 from scipy import ndimage
 
 from services import StorageService, SqliteStorageService
+from tiled_yolo import tiled_detect, TILE_SIZE, TILE_STRIDE
+from sam_segmenter import SamSegmenter
 
 LEAF_MODEL = "models/leaf-yolo11m-seg.pt"
 SPIKE_MODEL = "models/spike-yolo11x-seg.pt"
+SAM_ENCODER = "models/sam3_efficient_encoder.onnx"
+SAM_DECODER = "models/sam3_efficient_decoder.onnx"
 
 class Application(ApplicationInterface):
     def __init__(self,
@@ -34,10 +38,25 @@ class Application(ApplicationInterface):
             label2id = {'Healthy-Leaf': 0, 'Downy-Leaf': 1, 'Powdery-Leaf': 2}
             id2label = {0: 'Healthy-Leaf', 1: 'Downy-Leaf', 2: 'Powdery-Leaf'}
             self.classification = Classification("models/swinv2-tiny-patch4-window8-256", label2id=label2id, id2label=id2label)
+            # SAM is optional — if the ONNX exports aren't present we fall
+            # back to YOLO-seg's own masks so this refactor doesn't strand
+            # deployments that haven't dropped the ONNX files in yet.
+            self.sam = self._try_load_sam()
         else:
             self.segmentation = None
             self.segmentation_spike = None
             self.classification = None
+            self.sam = None
+
+    @staticmethod
+    def _try_load_sam():
+        if not (os.path.isfile(SAM_ENCODER) and os.path.isfile(SAM_DECODER)):
+            return None
+        try:
+            return SamSegmenter(SAM_ENCODER, SAM_DECODER)
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f"[application] SAM load failed, falling back to YOLO-seg: {exc}")
+            return None
 
     def segment_plant(self, file, task='leaf', data=None):
         guid = str(uuid.uuid4())
@@ -71,35 +90,118 @@ class Application(ApplicationInterface):
         return guid
 
     def _process_segmentation(self, guid, task):
-        if task == 'leaf':
-            results = self.segmentation(os.path.join(self.image_folder, f'{guid}.jpeg'))[0]
-        elif task == 'spike':
-            results = self.segmentation_spike(os.path.join(self.image_folder, f'{guid}.jpeg'))[0]
+        """New pipeline:
 
-        if results.boxes:
-            self._plants[guid]["bounding_boxes"] = results.boxes.xyxyn.tolist()
+        1. Slide a 1280×1280 window across the image with stride 640 and
+           run YOLO detection on each tile (boxes only — we drop masks).
+        2. NMS-merge the cross-tile detections so a target straddling a
+           tile boundary collapses back to one box.
+        3. For each surviving box, take the centroid and prompt SAM to
+           produce the actual segmentation mask. Falls back to YOLO-seg's
+           own masks if SAM isn't loaded (no ONNX files present).
+        """
+        image_path = os.path.join(self.image_folder, f'{guid}.jpeg')
+        image = self.read_image(image_path)
+        h, w = image.shape[:2]
 
-        if results.masks:
-            self._plants[guid]["masks"] = [mask.tolist() for mask in results.masks.xyn]
+        model = self.segmentation if task == 'leaf' else self.segmentation_spike
+        detections = tiled_detect(
+            image,
+            model,
+            tile=TILE_SIZE,
+            stride=TILE_STRIDE,
+        )
 
-        for i, mask_points in enumerate(self._plants[guid]["masks"]):
-            image = self.read_image(os.path.join(self.image_folder, f'{guid}.jpeg'))
+        # Bounding boxes are stored normalised (matching the old contract
+        # that the mobile app reads from `bounding_boxes`).
+        self._plants[guid]["bounding_boxes"] = [
+            [d.x1 / w, d.y1 / h, d.x2 / w, d.y2 / h] for d in detections
+        ]
 
-            mask = self._points_to_mask(mask_points, image.shape)
-            subimage = self._crop_image(image, mask)
-            cropped_mask = self._crop_image(mask, mask)
+        masks = self._segment_from_detections(image, detections)
+        # Masks are persisted as normalised polygon points for parity with
+        # the previous YOLO-seg output (`results.masks.xyn`). Empty masks
+        # — e.g. SAM produced nothing for a centroid — are stored as `[]`
+        # so the index lines up with `bounding_boxes`.
+        self._plants[guid]["masks"] = [
+            self._mask_to_normalised_polygon(m, w, h) for m in masks
+        ]
 
+        for i, mask in enumerate(masks):
+            if mask is None or mask.sum() == 0:
+                self._plants[guid]["labels"].append("Unknown")
+                continue
+            mask_chw = mask[:, :, np.newaxis]
+            subimage = self._crop_image(image, mask_chw)
+            cropped_mask = self._crop_image(mask_chw, mask_chw)
             if task == 'leaf':
                 label = self.classification.classify(cropped_mask * subimage)
             elif task == 'spike':
                 label = self._score_spike(subimage, cropped_mask)
             else:
                 label = "Unknown"
-
             self._plants[guid]["labels"].append(label)
 
         self._plants[guid]["status"] = "complete"
         self.storage.save_plant(self._plants[guid])
+
+    def _segment_from_detections(self, image, detections):
+        """Produce one binary mask per detection.
+
+        Uses SAM with the box centroid as a foreground point prompt
+        (plus the bbox as a box prompt — both help SAM lock onto the
+        instance instead of bleeding into neighbours). If SAM isn't
+        loaded, falls back to a rectangular mask over the bbox so the
+        rest of the pipeline still has something to crop against.
+        """
+        if not detections:
+            return []
+        if self.sam is None:
+            h, w = image.shape[:2]
+            fallback = []
+            for d in detections:
+                m = np.zeros((h, w), dtype=np.uint8)
+                x1, y1, x2, y2 = (int(max(0, d.x1)), int(max(0, d.y1)),
+                                  int(min(w, d.x2)), int(min(h, d.y2)))
+                m[y1:y2, x1:x2] = 1
+                fallback.append(m)
+            return fallback
+
+        embedding, letterbox = self.sam.encode(image)
+        masks = []
+        for d in detections:
+            cx, cy = d.centroid
+            mask = self.sam.predict(
+                embedding=embedding,
+                letterbox=letterbox,
+                points=[(cx, cy)],
+                point_labels=[1],
+                bbox=d.xyxy,
+            )
+            masks.append(mask)
+        return masks
+
+    @staticmethod
+    def _mask_to_normalised_polygon(mask, width, height):
+        """Convert a binary mask to the normalised polygon format the
+        mobile app already consumes (`results.masks.xyn` from Ultralytics:
+        a list of [x, y] pairs in 0..1). We use the largest external
+        contour — multi-component masks are rare for instance segmentation
+        and choosing the largest matches Ultralytics' own behaviour."""
+        if mask is None:
+            return []
+        contours, _ = cv2.findContours(
+            mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        if not contours:
+            return []
+        largest = max(contours, key=cv2.contourArea)
+        if len(largest) < 3:
+            return []
+        pts = largest.reshape(-1, 2).astype(np.float32)
+        pts[:, 0] /= width
+        pts[:, 1] /= height
+        return pts.tolist()
 
     def read_image(self, path):
         img = cv2.imread(path, cv2.IMREAD_COLOR)

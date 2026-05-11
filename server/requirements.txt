@@ -7,6 +7,9 @@ pillow
 numpy
 pytest
 ultralytics
+onnxruntime
+opencv-python
+scipy
 SQLAlchemy
 firebase-auth
 transformers
