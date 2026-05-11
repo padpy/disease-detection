@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# Launch the Gopher Eye API + chatbot in Docker.
+#
+# The chatbot is part of the API process — it's enabled by setting
+# GOPHER_EYE_LLM_CKPT (and GOPHER_EYE_LLM_DIR) before the server boots. This
+# script wires those env vars and the matching volume mounts into a single
+# `docker run` invocation so /dl/* and /v1/chat/completions come up together.
+#
+# Usage:
+#   server/run                       # build if needed, then run in the foreground
+#   server/run -d                    # detached
+#   LLM_CKPT=/abs/path server/run    # override the checkpoint
+#   PORT=5556 server/run             # publish a different host port
+#
+# Stop with Ctrl-C (foreground) or `docker stop gopher-eye-server` (detached).
+
+set -euo pipefail
+
+SERVER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SERVER_DIR/.." && pwd)"
+cd "$SERVER_DIR"
+
+IMAGE="${IMAGE:-gopher-eye-server}"
+CONTAINER="${CONTAINER:-gopher-eye-server}"
+PORT="${PORT:-5000}"
+
+# Where the BLIP_Qwen checkpoint and LLM source live on the host. Default to
+# the layout produced by LLM_work/how_to_use/assemble_model_demo.py.
+LLM_CKPT="${LLM_CKPT:-$REPO_ROOT/LLM_work/qwen3-1.7B-greenhouse-ngld-faithful-stage2}"
+LLM_DIR="${LLM_DIR:-$REPO_ROOT/LLM_work}"
+
+if [ ! -d "$LLM_CKPT" ]; then
+  echo "error: chatbot checkpoint not found: $LLM_CKPT" >&2
+  echo "       set LLM_CKPT=/abs/path/to/checkpoint and retry" >&2
+  exit 1
+fi
+if [ ! -d "$LLM_DIR" ]; then
+  echo "error: LLM source root not found: $LLM_DIR" >&2
+  echo "       set LLM_DIR=/abs/path/to/LLM_work and retry" >&2
+  exit 1
+fi
+
+if [[ -z "$(docker images -q "$IMAGE" 2>/dev/null)" ]]; then
+  echo "Building docker image '$IMAGE'..."
+  docker build -t "$IMAGE" .
+fi
+
+# If a previous run left a container behind, replace it so the new env vars
+# and mounts take effect.
+if [[ -n "$(docker ps -aq -f name="^${CONTAINER}$" 2>/dev/null)" ]]; then
+  docker rm -f "$CONTAINER" >/dev/null
+fi
+
+RUN_MODE=("--rm" "-it")
+for arg in "$@"; do
+  if [[ "$arg" == "-d" || "$arg" == "--detach" ]]; then
+    RUN_MODE=("-d")
+    break
+  fi
+done
+
+echo "Starting $CONTAINER on 127.0.0.1:$PORT (api + chatbot)"
+echo "  LLM_CKPT: $LLM_CKPT"
+echo "  LLM_DIR:  $LLM_DIR"
+
+exec docker run \
+  "${RUN_MODE[@]}" \
+  --name "$CONTAINER" \
+  -p "127.0.0.1:${PORT}:5000" \
+  -e GOPHER_EYE_LLM_CKPT=/llm/ckpt \
+  -e GOPHER_EYE_LLM_DIR=/llm/src \
+  -v "$SERVER_DIR/app:/app" \
+  -v "$SERVER_DIR/plants:/app/plants" \
+  -v "$SERVER_DIR/images:/app/images" \
+  -v "$SERVER_DIR/models:/app/models" \
+  -v "$SERVER_DIR/trials:/app/trials" \
+  -v "$SERVER_DIR/data:/app/data" \
+  -v "$LLM_CKPT:/llm/ckpt:ro" \
+  -v "$LLM_DIR:/llm/src:ro" \
+  "$IMAGE"
