@@ -39,6 +39,13 @@ LLM_DIR="${LLM_DIR:-$REPO_ROOT/LLM_work}"
 # Mounted into the container at the same absolute path so the symlink stays valid.
 SWIN_DIR="${SWIN_DIR:-/home/nickp/development/grape/hf-models/swinv2-tiny-patch4-window8-256/checkpoint-100}"
 
+# HuggingFace cache on the host — bind-mounted into /root/.cache/huggingface
+# so the container's transformers runtime finds the pre-downloaded SAM 3
+# weights (~3.3 GB) and the gated-model token without redownloading.
+# RW (not RO) because transformers wants to write its own metadata
+# (.no_exist markers, lock files) into the cache during load.
+HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
+
 if [ ! -d "$LLM_CKPT" ]; then
   echo "error: chatbot checkpoint not found: $LLM_CKPT" >&2
   echo "       set LLM_CKPT=/abs/path/to/checkpoint and retry" >&2
@@ -94,4 +101,5 @@ exec docker run \
   -v "$LLM_CKPT:/llm/ckpt:ro" \
   -v "$LLM_DIR:/llm/src:ro" \
   -v "$SWIN_DIR:$SWIN_DIR:ro" \
+  -v "$HF_CACHE:/root/.cache/huggingface" \
   "$IMAGE"

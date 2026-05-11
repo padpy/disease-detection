@@ -19,6 +19,7 @@ from tiled_yolo import (
     CROP_BBOX_PADDING,
 )
 from sam_segmenter import SAM_INPUT_SIZE, SamSegmenter
+from sam3_segmenter import SAM3_MODEL_ID, Sam3Prompt, Sam3Segmenter
 from wheat_head_detector import WheatHeadDetector
 
 LEAF_MODEL = "models/leaf-yolo11m-seg.pt"
@@ -27,6 +28,9 @@ LEAF_MODEL = "models/leaf-yolo11m-seg.pt"
 # weights with the same letterbox + parser keeps the server and on-device
 # wheat detections bit-for-bit comparable.
 WHEAT_HEAD_ONNX = "models/yolo26-wheat-head.onnx"
+# Legacy SAM ONNX (mobile-style encoder + decoder). Kept for the leaf
+# pipeline's per-crop encode/decode pattern; if the files aren't
+# present we fall back to rect-over-bbox masks like before.
 SAM_ENCODER = "models/sam3_efficient_encoder.onnx"
 SAM_DECODER = "models/sam3_efficient_decoder.onnx"
 
@@ -64,15 +68,22 @@ class Application(ApplicationInterface):
             label2id = {'Healthy-Leaf': 0, 'Downy-Leaf': 1, 'Powdery-Leaf': 2}
             id2label = {0: 'Healthy-Leaf', 1: 'Downy-Leaf', 2: 'Powdery-Leaf'}
             self.classification = Classification("models/swinv2-tiny-patch4-window8-256", label2id=label2id, id2label=id2label)
-            # SAM is optional — if the ONNX exports aren't present we fall
-            # back to YOLO-seg's own masks so this refactor doesn't strand
-            # deployments that haven't dropped the ONNX files in yet.
+            # Legacy SAM ONNX (only used by the leaf path). Optional —
+            # if the files aren't present, the leaf pipeline falls back
+            # to rect-over-bbox masks.
             self.sam = self._try_load_sam()
+            # Regular SAM 3 — the wheat-head pipeline's segmenter. Pulled
+            # from ``facebook/sam3`` via HF transformers. The gated repo
+            # requires an accepted licence on the HF token the runtime
+            # has access to; loading failures degrade the wheat path to
+            # rect masks (same fallback as ``self.sam``).
+            self.sam3 = self._try_load_sam3()
         else:
             self.segmentation = None
             self.wheat_head = None
             self.classification = None
             self.sam = None
+            self.sam3 = None
 
     @staticmethod
     def _try_load_sam():
@@ -82,6 +93,17 @@ class Application(ApplicationInterface):
             return SamSegmenter(SAM_ENCODER, SAM_DECODER)
         except Exception as exc:  # pragma: no cover - defensive
             print(f"[application] SAM load failed, falling back to YOLO-seg: {exc}")
+            return None
+
+    @staticmethod
+    def _try_load_sam3():
+        try:
+            return Sam3Segmenter(SAM3_MODEL_ID)
+        except Exception as exc:  # pragma: no cover - defensive
+            # Common reasons this fails: HF cache not mounted, token not
+            # accepted on the gated repo, network blocked at startup.
+            # Log and fall back to rect masks rather than crashing boot.
+            print(f"[application] SAM3 load failed, falling back to rect masks: {exc}")
             return None
 
     def segment_plant(self, file, task='leaf', data=None):
@@ -261,21 +283,24 @@ class Application(ApplicationInterface):
         ]
 
     def _wheat_head_masks(self, working, detections):
-        """SAM masks for each wheat-head detection.
+        """SAM 3 masks for each wheat-head detection.
 
-        The encoder runs **once** over the whole working image — same
-        global embedding the on-device pipeline reuses across all
-        per-head decoder passes. Each decoder pass gets the centroid as
-        a foreground point and the YOLO box as a box prompt, matching
-        the prompt set in ``wheat_head_pipeline.dart`` ``run``.
-        Falls back to rect-over-bbox masks if SAM isn't loaded so the
-        rest of the pipeline (scoring, polygon export) still has
+        Each detection contributes one ``Sam3Prompt`` with the YOLO
+        centroid (foreground point) and the YOLO bbox. We hand every
+        prompt to the segmenter in a single batched call: SAM 3 runs
+        the image encoder once and the prompt/decoder stack per object
+        inside that forward pass, so this is functionally the
+        "encode-once, decode-many" pattern the mobile pipeline uses,
+        without us having to drive the two halves separately.
+
+        Falls back to rect-over-bbox masks if SAM 3 isn't loaded so
+        the rest of the pipeline (scoring, polygon export) still has
         something to operate on.
         """
         if not detections:
             return []
         h, w = working.shape[:2]
-        if self.sam is None:
+        if self.sam3 is None:
             fallback = []
             for d in detections:
                 m = np.zeros((h, w), dtype=np.uint8)
@@ -287,19 +312,26 @@ class Application(ApplicationInterface):
                 fallback.append(m)
             return fallback
 
-        embedding, letterbox = self.sam.encode(working)
-        masks = []
-        for d in detections:
-            cx, cy = d.centroid
-            mask = self.sam.predict(
-                embedding=embedding,
-                letterbox=letterbox,
-                points=[(cx, cy)],
-                point_labels=[1],
+        prompts = [
+            Sam3Prompt(
+                point=(d.centroid[0], d.centroid[1]),
                 bbox=(d.x1, d.y1, d.x2, d.y2),
             )
-            masks.append(mask)
-        return masks
+            for d in detections
+        ]
+        masks = self.sam3.segment(working, prompts)
+        # Defensive: if SAM 3 returned a mask at a different resolution
+        # than the working image (shouldn't happen — post_process_masks
+        # resizes to original_sizes — but a malformed processor config
+        # could regress this), nearest-resize back so polygon export
+        # works.
+        out = []
+        for m in masks:
+            if m.shape == (h, w):
+                out.append(m)
+            else:
+                out.append(cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST))
+        return out
 
     @staticmethod
     def _resize_longest_edge(image, target):
