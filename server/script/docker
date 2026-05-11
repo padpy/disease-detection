@@ -5,4 +5,4 @@ if [[ "$(docker images -q gopher-eye-server 2> /dev/null)" == "" ]]; then
     docker build -t gopher-eye-server .
 fi
 
-docker run -v $(pwd)/app:/app -v $(pwd)/plants:/app/plants -v /mnt/s3-gopher-eye/images:/app/images -v $(pwd)/models:/app/models -v $(pwd)/trials:/app/trials -p 127.0.0.1:5000:5000 -d gopher-eye-server
+docker run -v $(pwd)/app:/app -v $(pwd)/plants:/app/plants -v /mnt/s3-gopher-eye/images:/app/images -v $(pwd)/models:/app/models -v $(pwd)/trials:/app/trials -p 10.0.1.10:5000:5000 -d gopher-eye-server
