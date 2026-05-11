@@ -73,7 +73,7 @@ class AppSettings {
   static const _envOpenAiKey = String.fromEnvironment('OPENAI_API_KEY');
   static const _envServerUrl = String.fromEnvironment('GOPHER_EYE_SERVER_URL');
 
-  static const defaultOpenAiModel = 'gpt-4o-mini';
+  static const defaultOpenAiModel = 'gpt-5';
   static const defaultServerLlmModel = 'gopher-eye-grape-leaf';
   static const defaultZtNetworkId = '6ab565387a1297b5';
 

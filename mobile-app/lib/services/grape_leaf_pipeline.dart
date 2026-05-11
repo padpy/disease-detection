@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:ui' show Rect;
 
 import 'package:flutter/foundation.dart';
@@ -335,6 +336,80 @@ class GrapeLeafPipeline {
     );
   }
 
+  /// Run YOLO leaf detection on [imageBytes] and return a tight crop around
+  /// the leaf whose centroid sits closest to the image centre. Used by the
+  /// chatbot to focus the LLM on a single in-frame leaf rather than the whole
+  /// scene. Returns null when no leaf clears the score threshold.
+  ///
+  /// SAM is intentionally skipped here: a rectangular bbox crop with a small
+  /// pad is enough for vision LLM diagnosis, and skipping the encoder pass
+  /// keeps chatbot launch latency on par with the existing image upload.
+  Future<CentralLeafCrop?> findCentralLeafCrop(Uint8List imageBytes) async {
+    await _ensureLoaded();
+    final decoded = img.decodeImage(imageBytes);
+    if (decoded == null) return null;
+
+    final wheat = WheatHeadPipeline.instance;
+    final working = wheat.resizeLongestEdge(decoded, _kSamWorkingEdge);
+    final candidates = await _detectLeaves(working);
+    if (candidates.isEmpty) {
+      debugPrint('[grape] central-leaf: no detections');
+      return null;
+    }
+
+    final cx = working.width / 2;
+    final cy = working.height / 2;
+    final diag = math.sqrt(
+      working.width * working.width + working.height * working.height,
+    );
+
+    Candidate? best;
+    double bestScore = double.infinity;
+    for (final cand in candidates) {
+      final dx = cand.centroid.dx - cx;
+      final dy = cand.centroid.dy - cy;
+      final dist = math.sqrt(dx * dx + dy * dy) / diag; // 0 = perfectly centred
+      // Prefer central, larger, more confident leaves. Distance dominates;
+      // confidence + area only break ties between near-centre candidates.
+      final area = cand.bbox.width * cand.bbox.height /
+          (working.width * working.height);
+      final score = dist - 0.05 * cand.score - 0.05 * area;
+      if (score < bestScore) {
+        bestScore = score;
+        best = cand;
+      }
+    }
+    if (best == null) return null;
+
+    // Pad the bbox by 8% of its longest side so the leaf isn't crammed
+    // edge-to-edge in the crop — vision models do better with a little context.
+    final pad = math.max(best.bbox.width, best.bbox.height) * 0.08;
+    final x0 = (best.bbox.left - pad).floor().clamp(0, working.width - 1);
+    final y0 = (best.bbox.top - pad).floor().clamp(0, working.height - 1);
+    final x1 = (best.bbox.right + pad).ceil().clamp(x0 + 1, working.width);
+    final y1 = (best.bbox.bottom + pad).ceil().clamp(y0 + 1, working.height);
+
+    final cropped = img.copyCrop(
+      working,
+      x: x0,
+      y: y0,
+      width: x1 - x0,
+      height: y1 - y0,
+    );
+    final png = Uint8List.fromList(img.encodePng(cropped));
+    debugPrint(
+      '[grape] central-leaf: picked bbox=${best.bbox} '
+      'conf=${best.score.toStringAsFixed(2)} crop=${cropped.width}x${cropped.height}',
+    );
+    return CentralLeafCrop(
+      pngBytes: png,
+      width: cropped.width,
+      height: cropped.height,
+      sourceBbox: best.bbox,
+      confidence: best.score,
+    );
+  }
+
   // ---------- YOLO11-seg (pre-NMS, channel-major) ----------
 
   Future<List<Candidate>> _detectLeaves(img.Image working) async {
@@ -566,4 +641,23 @@ class GrapeLeafPipeline {
     final variance = (sumSq / count) - (mean * mean);
     return variance < 0 ? 0 : variance;
   }
+}
+
+/// Result of [GrapeLeafPipeline.findCentralLeafCrop]: the PNG-encoded crop the
+/// chatbot displays + sends to the LLM, plus the source bbox + detection
+/// confidence for debugging.
+class CentralLeafCrop {
+  const CentralLeafCrop({
+    required this.pngBytes,
+    required this.width,
+    required this.height,
+    required this.sourceBbox,
+    required this.confidence,
+  });
+
+  final Uint8List pngBytes;
+  final int width;
+  final int height;
+  final Rect sourceBbox;
+  final double confidence;
 }
