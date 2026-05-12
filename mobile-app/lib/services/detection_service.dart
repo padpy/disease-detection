@@ -305,8 +305,8 @@ class DetectionService extends ChangeNotifier {
       await runDiseaseAnalysis(
         mode: job.mode,
         workingPng: workingPng,
-        workingW: imageW,
-        workingH: imageH,
+        workingW: maskW,
+        workingH: maskH,
         instances: saved,
         sampleId: job.sampleId,
         sourceOverride: fullRes,
