@@ -206,12 +206,10 @@ class DetectionService extends ChangeNotifier {
 
       final boxes = (data['bounding_boxes'] as List?) ?? const [];
       final masks = (data['masks'] as List?) ?? const [];
-      final labels = (data['labels'] as List?) ?? const [];
 
       final repo = SampleRepository.instance;
       final now = DateTime.now();
       final toSave = <SampleInstance>[];
-      final maskRefs = <({Uint8List mask, int width, int height})>[];
 
       for (var i = 0; i < boxes.length; i++) {
         final box = boxes[i];
@@ -243,10 +241,7 @@ class DetectionService extends ChangeNotifier {
           maskHeight: imageH,
           bbox: bbox,
         );
-        maskRefs.add((mask: maskBytes, width: imageW, height: imageH));
 
-        final label = i < labels.length ? labels[i]?.toString() : null;
-        final fhbRatio = _extractFhbRatio(label);
         toSave.add(SampleInstance(
           sampleId: job.sampleId,
           idx: i,
@@ -259,8 +254,6 @@ class DetectionService extends ChangeNotifier {
           previewPng: previewPng,
           createdAt: now,
           updatedAt: now,
-          fhbRatio: fhbRatio,
-          fhbSeverity: label,
         ));
       }
 
@@ -274,19 +267,34 @@ class DetectionService extends ChangeNotifier {
         width: imageW,
         height: imageH,
       );
-      await repo.replaceInstances(sampleId: job.sampleId, instances: toSave);
+      final saved =
+          await repo.replaceInstances(sampleId: job.sampleId, instances: toSave);
 
-      Uint8List? segPng;
-      if (maskRefs.isNotEmpty) {
-        segPng = pipe.renderCombinedSegmentationOverlay(
-          width: imageW,
-          height: imageH,
-          masks: maskRefs,
-        );
-      }
-      await repo.saveSegmentationOverlay(
+      // Run the on-device disease analyzer over the server-supplied masks so
+      // each instance gets a proper per-pixel classification map (and the
+      // combined disease + segmentation overlays). The server only returns a
+      // single ``FHB: 0.XX`` string per mask, which is fine as a numeric
+      // ratio but doesn't give us the green/red/yellow tile the viewer
+      // expects in "Disease" mode — without this pass the disease preview
+      // falls back to the segmentation outline.
+      notifier.value = DetectionRunning(
+        phase: 'Analyzing disease',
+        progress: saved.isEmpty ? null : 0,
+      );
+      await runDiseaseAnalysis(
+        mode: job.mode,
+        workingPng: workingPng,
+        workingW: imageW,
+        workingH: imageH,
+        instances: saved,
         sampleId: job.sampleId,
-        png: segPng,
+        sourceOverride: fullRes,
+        onProgress: (done, total) {
+          notifier.value = DetectionRunning(
+            phase: 'Analyzing disease $done/$total',
+            progress: total > 0 ? done / total : null,
+          );
+        },
       );
 
       stopwatch.stop();
@@ -387,18 +395,6 @@ class DetectionService extends ChangeNotifier {
         }
       }
     }
-  }
-
-  /// Pull a numeric ratio out of server-supplied labels like "FHB: 0.42".
-  /// Returns null for grape-leaf string labels (Healthy-Leaf, Downy-Leaf, …).
-  double? _extractFhbRatio(String? label) {
-    if (label == null) return null;
-    final match = RegExp(r'([0-9]*\.?[0-9]+)').firstMatch(label);
-    if (match == null) return null;
-    final v = double.tryParse(match.group(1) ?? '');
-    if (v == null) return null;
-    if (v < 0 || v > 1) return null;
-    return v;
   }
 
   /// On-device pipeline: YOLO + SAM auto-detection, replace instances, then

@@ -1,4 +1,5 @@
 import os
+import time
 import uuid
 import threading
 from application_interface import ApplicationInterface
@@ -270,32 +271,64 @@ class Application(ApplicationInterface):
         ``x / working_w == x / original_w`` so the existing contract
         the rest of the server consumes is unchanged.
         """
+        t_total = time.perf_counter()
+
+        t0 = time.perf_counter()
         image_path = os.path.join(self.image_folder, f'{guid}.jpeg')
         full_image = self.read_image(image_path)
+        fh, fw = full_image.shape[:2]
+        print(f"[wheat][{guid[:8]}] decode {fw}x{fh} dt={time.perf_counter() - t0:.3f}s")
+
+        t0 = time.perf_counter()
         working = self._resize_longest_edge(
             full_image, WHEAT_WORKING_LONG_EDGE
         )
         h, w = working.shape[:2]
+        print(f"[wheat][{guid[:8]}] resize {w}x{h} dt={time.perf_counter() - t0:.3f}s")
 
+        t0 = time.perf_counter()
         detections = self._wheat_head_detect(working)
+        print(
+            f"[wheat][{guid[:8]}] yolo n={len(detections)} "
+            f"dt={time.perf_counter() - t0:.3f}s"
+        )
+
+        t0 = time.perf_counter()
         masks = self._wheat_head_masks(working, detections)
+        print(
+            f"[wheat][{guid[:8]}] sam3-masks n={len(masks)} "
+            f"dt={time.perf_counter() - t0:.3f}s"
+        )
 
         # Two-pass SAM 3 text reconciliation: drop YOLO false
         # positives that don't agree with a "wheat head" PCS at
         # default conf, then add high-conf PCS instances YOLO missed.
         # Done before the normalised-bbox/polygon dump so both lists
         # stay aligned with the final detection set.
+        t0 = time.perf_counter()
+        pre_n = len(detections)
         detections, masks = self._reconcile_with_text(
             working, detections, masks
         )
+        print(
+            f"[wheat][{guid[:8]}] reconcile {pre_n}->{len(detections)} "
+            f"dt={time.perf_counter() - t0:.3f}s"
+        )
 
+        t0 = time.perf_counter()
         self._plants[guid]["bounding_boxes"] = [
             [d.x1 / w, d.y1 / h, d.x2 / w, d.y2 / h] for d in detections
         ]
         self._plants[guid]["masks"] = [
             self._mask_to_normalised_polygon(m, w, h) for m in masks
         ]
+        print(
+            f"[wheat][{guid[:8]}] polygon-dump n={len(masks)} "
+            f"dt={time.perf_counter() - t0:.3f}s"
+        )
 
+        t0 = time.perf_counter()
+        scored = 0
         for mask in masks:
             if mask is None or mask.sum() == 0:
                 self._plants[guid]["labels"].append("Unknown")
@@ -306,9 +339,21 @@ class Application(ApplicationInterface):
             self._plants[guid]["labels"].append(
                 self._score_spike(subimage, cropped_mask)
             )
+            scored += 1
+        print(
+            f"[wheat][{guid[:8]}] score-spike n={scored}/{len(masks)} "
+            f"dt={time.perf_counter() - t0:.3f}s"
+        )
 
+        t0 = time.perf_counter()
         self._plants[guid]["status"] = "complete"
         self.storage.save_plant(self._plants[guid])
+        print(f"[wheat][{guid[:8]}] save dt={time.perf_counter() - t0:.3f}s")
+
+        print(
+            f"[wheat][{guid[:8]}] TOTAL n={len(detections)} "
+            f"dt={time.perf_counter() - t_total:.3f}s"
+        )
 
     def _wheat_head_detect(self, working):
         """Single-pass YOLO26 ONNX on the working image.
@@ -406,10 +451,15 @@ class Application(ApplicationInterface):
             return detections, masks
 
         # Pass 1 — reject YOLO false positives.
+        t0 = time.perf_counter()
         default_hits = self.sam3_text.detect(
             working,
             WHEAT_TEXT_PROMPT,
             threshold=WHEAT_TEXT_DEFAULT_CONF,
+        )
+        print(
+            f"[wheat] reconcile.pass1 hits={len(default_hits)} "
+            f"dt={time.perf_counter() - t0:.3f}s"
         )
         if default_hits:
             default_masks = [hit.mask for hit in default_hits]
@@ -430,10 +480,15 @@ class Application(ApplicationInterface):
             masks = [masks[i] for i in keep_idx]
 
         # Pass 2 — add missed wheat heads.
+        t0 = time.perf_counter()
         high_hits = self.sam3_text.detect(
             working,
             WHEAT_TEXT_PROMPT,
             threshold=WHEAT_TEXT_HIGH_CONF,
+        )
+        print(
+            f"[wheat] reconcile.pass2 hits={len(high_hits)} "
+            f"dt={time.perf_counter() - t0:.3f}s"
         )
         added = 0
         for hit in high_hits:
