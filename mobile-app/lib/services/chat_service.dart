@@ -38,10 +38,20 @@ enum LeafDiagnosis { healthy, downyMildew, powderyMildew, otherDisease }
 /// Standing system prompt that defines the chatbot's role + the strict
 /// 4-category diagnosis vocabulary. Used as the system message on every
 /// outbound chat request so follow-ups stay on-topic and on-vocabulary.
+///
+/// The symptom hints below are deliberate: without them the model tends to
+/// confuse the two mildews (they're both "mildew" in name but look nothing
+/// alike on the leaf). Anchoring on the top-of-leaf white powder vs. the
+/// oily spots / underside fuzz keeps the classifications stable.
 const String kAgronomistSystemPrompt =
     'You are an agronomist helping diagnose leaf disease. '
     'Choose if the leaf has one of the following diagnosis: '
     'healthy, downy mildew, powdery mildew, or other disease. '
+    'Use these symptom hints when deciding: '
+    'powdery mildew shows a powdery white substance on the tops of leaves; '
+    'downy mildew shows oily yellow, brown, or black spots on the top of the '
+    'leaf, the same symptoms on the underside, or a white thicker mold on '
+    'the underside. '
     'Respond in a concise, friendly manner acknowledging reviewing the leaf '
     'and providing the diagnosis. Keep the initial reply to two short '
     'sentences and end with the chosen diagnosis on its own line in the form '
@@ -61,6 +71,37 @@ const String kExplainDiagnosisPrompt =
     'support the diagnosis you just gave. Reference specific things you see '
     '(e.g. lesion shape, colour, distribution, texture) rather than general '
     'disease facts. Keep the tone friendly and concrete.';
+
+/// System prompt for the local/server model during the hybrid initial-
+/// diagnosis flow. The specialist model gets the analytical job: list what
+/// it sees and pick a category. OpenAI handles the user-facing copy in a
+/// second pass, so this prompt deliberately doesn't constrain length or
+/// tone — only output structure.
+const String kLocalDiagnosticPrompt =
+    'You are a specialist grape-leaf disease model. Examine the attached '
+    'leaf image and list the visible symptoms you observe (colour, texture, '
+    'location on leaf, distribution). Then choose one diagnosis from: '
+    'healthy, downy mildew, powdery mildew, or other disease. '
+    'Use these symptom hints: '
+    'powdery mildew shows a powdery white substance on the tops of leaves; '
+    'downy mildew shows oily yellow, brown, or black spots on the top of '
+    'the leaf, the same symptoms on the underside, or a white thicker mold '
+    'on the underside. '
+    'End with the chosen diagnosis on its own line in the form '
+    '"Diagnosis: <one of: healthy, downy mildew, powdery mildew, other disease>".';
+
+/// System prompt for the OpenAI summariser pass. Given the local model's
+/// notes (observations + diagnosis), it produces the friendly two-sentence
+/// reply the user actually sees. Preserves the local's diagnosis verbatim.
+const String kSummarizerSystemPrompt =
+    'You are an agronomist relaying a specialist colleague\'s leaf diagnosis '
+    'to a grower. You will receive the specialist\'s notes (observations + '
+    'chosen diagnosis) alongside the leaf image. Acknowledge the review in '
+    'two short, friendly sentences that reference the single most telling '
+    'symptom from the notes, then end with the diagnosis on its own line in '
+    'the form '
+    '"Diagnosis: <one of: healthy, downy mildew, powdery mildew, other disease>". '
+    'Use the specialist\'s chosen diagnosis verbatim; do not change it.';
 
 /// Routes chat prompts to whichever LLM provider the user has configured. The
 /// system prompt + chat history are built the same way regardless of provider
@@ -99,12 +140,37 @@ class ChatService {
   /// Send [userMessage] alongside [imagePng] for the active chatbot session.
   /// [history] is every prior turn in order, *not* including the user turn
   /// being sent now. Returns the assistant's text reply.
+  ///
+  /// When [initialDiagnosis] is true *and* the active provider is the
+  /// local/server model, we run a two-stage pipeline: the specialist server
+  /// model produces the raw diagnosis, then OpenAI rewrites it into the
+  /// user-facing two-sentence summary. If OpenAI isn't configured we fall
+  /// back to the local model's raw output so the user still gets an answer.
   Future<String> reply({
     required Uint8List imagePng,
     required List<LlmTurn> history,
     required String userMessage,
+    bool initialDiagnosis = false,
   }) async {
     final provider = await AppSettings.getLlmProvider();
+
+    if (initialDiagnosis && provider == LlmProvider.server) {
+      final notes = await _replyServer(
+        systemPrompt: kLocalDiagnosticPrompt,
+        history: history,
+        userMessage: userMessage,
+        imagePng: imagePng,
+      );
+      try {
+        return await _summarizeWithOpenAI(
+          diagnosticNotes: notes,
+          imagePng: imagePng,
+        );
+      } on ChatConfigException {
+        return notes;
+      }
+    }
+
     switch (provider) {
       case LlmProvider.openai:
         return _replyOpenAI(
@@ -121,6 +187,42 @@ class ChatService {
           imagePng: imagePng,
         );
     }
+  }
+
+  /// Second-pass summariser used by the hybrid initial-diagnosis flow. Takes
+  /// the local model's raw observations + diagnosis and produces the
+  /// user-facing reply via OpenAI. Throws [ChatConfigException] if no OpenAI
+  /// key is configured — caller decides whether to fall back.
+  Future<String> _summarizeWithOpenAI({
+    required String diagnosticNotes,
+    required Uint8List imagePng,
+  }) async {
+    final apiKey = await AppSettings.getOpenAiApiKey();
+    if (apiKey == null || apiKey.isEmpty) {
+      throw const ChatConfigException(
+        'OpenAI API key not set; cannot summarise the local diagnosis.',
+      );
+    }
+    final modelName = await AppSettings.getOpenAiModel();
+    final llm = ChatOpenAI(
+      apiKey: apiKey,
+      defaultOptions: ChatOpenAIOptions(
+        model: modelName,
+        temperature: 0.3,
+      ),
+    );
+    final userPrompt =
+        'Specialist model\'s diagnostic notes for the attached leaf:\n\n'
+        '$diagnosticNotes\n\n'
+        'Summarise the diagnosis for the grower in the required two-sentence '
+        '+ "Diagnosis: …" line format. Reference the single most telling '
+        'symptom from the notes. Use the specialist\'s diagnosis verbatim.';
+    final messages = <ChatMessage>[
+      ChatMessage.system(kSummarizerSystemPrompt),
+      _humanWithImage(userPrompt, imagePng),
+    ];
+    final result = await llm.invoke(PromptValue.chat(messages));
+    return result.output.content;
   }
 
   Future<String> _replyOpenAI({

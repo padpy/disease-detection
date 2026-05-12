@@ -14,6 +14,13 @@ import 'package:gopher_eye/services/sync_service.dart';
 import 'package:gopher_eye/services/wheat_head_pipeline.dart';
 import 'package:image/image.dart' as img;
 
+/// Longest-edge target (px) for the working image used when hydrating remote
+/// detection results. Matches the local pipeline's working resolution so mask
+/// rasterization, PNG encoding, and overlay rendering cost the same on both
+/// paths — and so the UI isolate doesn't have to chew through full-resolution
+/// (e.g. 4032×3024) pixel loops after every server detection.
+const int _kRemoteWorkingEdge = 1024;
+
 /// Status of the detection pipeline for a single sample. Statuses are
 /// produced by [DetectionService] and consumed by the UI to drive progress
 /// indicators on the samples list and the sample viewer.
@@ -157,8 +164,11 @@ class DetectionService extends ChangeNotifier {
   /// ``/dl/segmentation*`` endpoint, poll until it reports complete, then
   /// hydrate the local instances list from ``/plant/data``. The server's
   /// returned masks are normalized polygons; we rasterize them at the
-  /// original image resolution into binary mask PNGs so the editor + viewer
-  /// behave the same as for locally-detected samples.
+  /// **working-image** resolution (matching the local pipeline's 1024
+  /// longest-edge scheme) so the post-server hydration — mask raster, PNG
+  /// encode, segmentation overlay — doesn't slam the UI isolate with
+  /// full-resolution pixel loops. The full-res image is kept only as a
+  /// high-fidelity `source` for per-instance preview tiles.
   Future<void> _processRemoteDetect(_PendingJob job) async {
     final notifier = _ensureNotifier(job.sampleId);
     notifier.value =
@@ -201,8 +211,15 @@ class DetectionService extends ChangeNotifier {
 
       final pipe = WheatHeadPipeline.instance;
       final fullRes = await pipe.decodeImageFile(file);
-      final imageW = fullRes.width;
-      final imageH = fullRes.height;
+      // Downscale to the same 1024 longest-edge frame the local pipeline
+      // uses for masks. Rasterizing N polygons at full-res can cost 10×+
+      // more pixel ops than rasterizing at working-res, and every one of
+      // those ops is on the main isolate. Server polygons are normalized
+      // (0..1) so they rasterize identically at any resolution.
+      const workingEdge = _kRemoteWorkingEdge;
+      final working = pipe.resizeLongestEdge(fullRes, workingEdge);
+      final maskW = working.width;
+      final maskH = working.height;
 
       final boxes = (data['bounding_boxes'] as List?) ?? const [];
       final masks = (data['masks'] as List?) ?? const [];
@@ -214,10 +231,10 @@ class DetectionService extends ChangeNotifier {
       for (var i = 0; i < boxes.length; i++) {
         final box = boxes[i];
         if (box is! List || box.length < 4) continue;
-        final x1 = (box[0] as num).toDouble().clamp(0.0, 1.0) * imageW;
-        final y1 = (box[1] as num).toDouble().clamp(0.0, 1.0) * imageH;
-        final x2 = (box[2] as num).toDouble().clamp(0.0, 1.0) * imageW;
-        final y2 = (box[3] as num).toDouble().clamp(0.0, 1.0) * imageH;
+        final x1 = (box[0] as num).toDouble().clamp(0.0, 1.0) * maskW;
+        final y1 = (box[1] as num).toDouble().clamp(0.0, 1.0) * maskH;
+        final x2 = (box[2] as num).toDouble().clamp(0.0, 1.0) * maskW;
+        final y2 = (box[3] as num).toDouble().clamp(0.0, 1.0) * maskH;
         final bbox = Rect.fromLTRB(x1, y1, x2, y2);
         final centroid = Offset(
           (bbox.left + bbox.right) / 2,
@@ -225,20 +242,23 @@ class DetectionService extends ChangeNotifier {
         );
 
         final polygon = (i < masks.length && masks[i] is List)
-            ? _polygonInPixels(masks[i] as List, imageW, imageH)
+            ? _polygonInPixels(masks[i] as List, maskW, maskH)
             : null;
         final maskBytes = _rasterizeMask(
-          imageW,
-          imageH,
+          maskW,
+          maskH,
           polygon: polygon,
           fallback: bbox,
         );
-        final maskPng = pipe.encodeMaskPng(maskBytes, imageW, imageH);
+        final maskPng = pipe.encodeMaskPng(maskBytes, maskW, maskH);
+        // `source: fullRes` so the per-instance preview tile uses crisp
+        // capture pixels; the mask coords scale on the fly inside the
+        // renderer. This matches the local pipeline's preview rendering.
         final previewPng = pipe.renderInstancePreview(
           source: fullRes,
           mask: maskBytes,
-          maskWidth: imageW,
-          maskHeight: imageH,
+          maskWidth: maskW,
+          maskHeight: maskH,
           bbox: bbox,
         );
 
@@ -248,8 +268,8 @@ class DetectionService extends ChangeNotifier {
           bbox: bbox,
           centroid: centroid,
           score: 1.0,
-          imageWidth: imageW,
-          imageHeight: imageH,
+          imageWidth: maskW,
+          imageHeight: maskH,
           maskPng: maskPng,
           previewPng: previewPng,
           createdAt: now,
@@ -258,14 +278,15 @@ class DetectionService extends ChangeNotifier {
       }
 
       // Persist a working image so downstream code (editor, sync) has the
-      // same shape it gets in the local pipeline. Server returns
-      // full-resolution masks, so the working image is just the original.
-      final workingPng = Uint8List.fromList(img.encodePng(fullRes));
+      // same shape it gets in the local pipeline — i.e. PNG of the
+      // downscaled working frame, not the full-res capture. Re-encoding the
+      // full-res image as PNG used to cost hundreds of ms on the UI isolate.
+      final workingPng = Uint8List.fromList(img.encodePng(working));
       await repo.saveWorkingImage(
         sampleId: job.sampleId,
         png: workingPng,
-        width: imageW,
-        height: imageH,
+        width: maskW,
+        height: maskH,
       );
       final saved =
           await repo.replaceInstances(sampleId: job.sampleId, instances: toSave);

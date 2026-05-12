@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:gopher_eye/services/chat_service.dart';
@@ -7,6 +9,10 @@ import 'package:gopher_eye/services/grape_leaf_pipeline.dart';
 /// the session ends when the user pops back to the camera. There's no
 /// per-image persistence layer because chatbot mode is meant for transient
 /// "ask about this leaf" conversations triggered from the camera.
+///
+/// The flow is entirely chip-driven: leaf extraction + initial diagnosis run
+/// automatically on mount, and follow-ups are restricted to the action chips
+/// at the bottom of the screen. No free-form text input.
 class ChatbotScreen extends StatefulWidget {
   const ChatbotScreen({super.key, required this.imageBytes});
 
@@ -20,8 +26,38 @@ class ChatbotScreen extends StatefulWidget {
   State<ChatbotScreen> createState() => _ChatbotScreenState();
 }
 
+/// One step in the rotating thinking-status sequence. We cycle through the
+/// list while waiting on the LLM (or on YOLO during the initial extract),
+/// swapping the bubble text every [_kStatusRotateInterval].
+const Duration _kStatusRotateInterval = Duration(milliseconds: 1600);
+
+/// Statuses shown in the thinking bubble for each phase. Kept here (rather
+/// than inlined at the call site) so copy lives in one place and the lists
+/// can be tweaked without disturbing the state machine.
+const List<String> _kStatusExtracting = [
+  'Scanning the photo for leaves…',
+  'Picking the most central leaf…',
+  'Cropping the leaf for review…',
+];
+const List<String> _kStatusDiagnosing = [
+  'Reviewing the leaf…',
+  'Looking for mildew, lesions, and discolouration…',
+  'Comparing against healthy / downy / powdery patterns…',
+  'Forming a diagnosis…',
+  'Summarising the findings…',
+];
+const List<String> _kStatusExplaining = [
+  'Re-examining visible symptoms…',
+  'Picking out the most telling signs…',
+  'Drafting the explanation…',
+];
+const List<String> _kStatusTreatment = [
+  'Gathering common treatments…',
+  'Looking up extension program resources…',
+  'Putting the recommendations together…',
+];
+
 class _ChatbotScreenState extends State<ChatbotScreen> {
-  final TextEditingController _input = TextEditingController();
   final ScrollController _scroll = ScrollController();
   final List<LlmTurn> _turns = [];
   bool _sending = false;
@@ -40,6 +76,12 @@ class _ChatbotScreenState extends State<ChatbotScreen> {
   /// line. Drives whether the follow-up chip row is visible.
   LeafDiagnosis? _diagnosis;
 
+  /// Active rotating-status list + which slot is currently visible. Empty
+  /// when no work is in flight (the bubble is hidden in that case).
+  List<String> _statuses = const [];
+  int _statusIdx = 0;
+  Timer? _statusTimer;
+
   @override
   void initState() {
     super.initState();
@@ -48,14 +90,17 @@ class _ChatbotScreenState extends State<ChatbotScreen> {
 
   @override
   void dispose() {
-    _input.dispose();
+    _statusTimer?.cancel();
     _scroll.dispose();
     super.dispose();
   }
 
   /// Run leaf extraction, then auto-send the initial diagnosis prompt so the
-  /// user lands on a screen that already has the agronomist's read.
+  /// user lands on a screen that already has the agronomist's read. The
+  /// status bubble cycles through extract → diagnose copy so the user can
+  /// see what stage we're on.
   Future<void> _bootstrap() async {
+    _startStatuses(_kStatusExtracting);
     try {
       final crop = await GrapeLeafPipeline.instance
           .findCentralLeafCrop(widget.imageBytes);
@@ -74,16 +119,26 @@ class _ChatbotScreenState extends State<ChatbotScreen> {
         _extracting = false;
       });
     }
-    await _sendUserMessage(kInitialDiagnosisPrompt, visibleText: null);
+    await _sendUserMessage(
+      kInitialDiagnosisPrompt,
+      visibleText: null,
+      statuses: _kStatusDiagnosing,
+      initialDiagnosis: true,
+    );
   }
 
   /// Send [content] as a user turn. When [visibleText] is null the user turn
   /// is suppressed from the transcript (used for the auto-sent initial
   /// diagnosis prompt so the chat opens with the assistant's read, not a
   /// duplicated request from the user).
+  ///
+  /// [initialDiagnosis] flips on the local-then-OpenAI hybrid pipeline in
+  /// [ChatService.reply] when the server LLM is the active provider.
   Future<void> _sendUserMessage(
     String content, {
     String? visibleText,
+    required List<String> statuses,
+    bool initialDiagnosis = false,
   }) async {
     if (_sending) return;
     setState(() {
@@ -93,6 +148,7 @@ class _ChatbotScreenState extends State<ChatbotScreen> {
         _turns.add(LlmTurn(role: LlmRole.user, content: visibleText));
       }
     });
+    _startStatuses(statuses);
     _scrollToBottom();
     try {
       // History is everything *before* this new user message — strip the
@@ -104,6 +160,7 @@ class _ChatbotScreenState extends State<ChatbotScreen> {
         imagePng: _leafPng ?? widget.imageBytes,
         history: history,
         userMessage: content,
+        initialDiagnosis: initialDiagnosis,
       );
       if (!mounted) return;
       final parsed = parseLeafDiagnosis(reply);
@@ -120,21 +177,18 @@ class _ChatbotScreenState extends State<ChatbotScreen> {
       if (!mounted) return;
       setState(() => _error = 'Chat failed: $e');
     } finally {
-      if (mounted) setState(() => _sending = false);
+      if (mounted) {
+        _stopStatuses();
+        setState(() => _sending = false);
+      }
     }
-  }
-
-  Future<void> _sendTyped() async {
-    final text = _input.text.trim();
-    if (text.isEmpty) return;
-    _input.clear();
-    await _sendUserMessage(text, visibleText: text);
   }
 
   Future<void> _onExplain() async {
     await _sendUserMessage(
       kExplainDiagnosisPrompt,
       visibleText: 'Explain diagnosis',
+      statuses: _kStatusExplaining,
     );
   }
 
@@ -146,11 +200,47 @@ class _ChatbotScreenState extends State<ChatbotScreen> {
     final visible = state == null
         ? 'Help resources for treatment'
         : 'Help resources for treatment · $state';
-    await _sendUserMessage(prompt, visibleText: visible);
+    await _sendUserMessage(
+      prompt,
+      visibleText: visible,
+      statuses: _kStatusTreatment,
+    );
   }
 
   void _onDiagnoseAnother() {
     Navigator.of(context).pop();
+  }
+
+  /// Begin (or replace) the rotating-status bubble with [statuses]. Resets to
+  /// the first entry and ticks forward every [_kStatusRotateInterval]. The
+  /// last entry stays put once reached so we never wrap mid-thought.
+  void _startStatuses(List<String> statuses) {
+    _statusTimer?.cancel();
+    if (statuses.isEmpty) {
+      setState(() {
+        _statuses = const [];
+        _statusIdx = 0;
+      });
+      return;
+    }
+    setState(() {
+      _statuses = statuses;
+      _statusIdx = 0;
+    });
+    _statusTimer = Timer.periodic(_kStatusRotateInterval, (_) {
+      if (!mounted) return;
+      if (_statusIdx >= _statuses.length - 1) return;
+      setState(() => _statusIdx += 1);
+    });
+  }
+
+  void _stopStatuses() {
+    _statusTimer?.cancel();
+    _statusTimer = null;
+    setState(() {
+      _statuses = const [];
+      _statusIdx = 0;
+    });
   }
 
   /// Bottom-sheet picker for the user's state. Returns the chosen state name
@@ -249,9 +339,27 @@ class _ChatbotScreenState extends State<ChatbotScreen> {
       ));
   }
 
+  /// Items to render in the transcript: every committed turn, plus a
+  /// synthetic "thinking" turn at the tail whenever the agronomist is
+  /// working. Returning a single list keeps the ListView builder simple and
+  /// lets the thinking bubble share styling with real assistant bubbles.
+  List<_TranscriptItem> _buildItems() {
+    final items = <_TranscriptItem>[
+      for (final t in _turns) _TranscriptItem.turn(t),
+    ];
+    final showThinking = _extracting || _sending;
+    if (showThinking && _statuses.isNotEmpty) {
+      final idx = _statusIdx.clamp(0, _statuses.length - 1);
+      items.add(_TranscriptItem.thinking(_statuses[idx]));
+    }
+    return items;
+  }
+
   @override
   Widget build(BuildContext context) {
     final mediaHeight = MediaQuery.of(context).size.height;
+    final items = _buildItems();
+    final chipsDisabled = _sending || _extracting;
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(
@@ -272,15 +380,21 @@ class _ChatbotScreenState extends State<ChatbotScreen> {
               fromYolo: _leafFromYolo,
             ),
             Expanded(
-              child: _turns.isEmpty
-                  ? _EmptyState(extracting: _extracting)
+              child: items.isEmpty
+                  ? const SizedBox.shrink()
                   : ListView.builder(
                       controller: _scroll,
                       padding: const EdgeInsets.symmetric(
                           horizontal: 16, vertical: 12),
-                      itemCount: _turns.length,
+                      itemCount: items.length,
                       itemBuilder: (_, i) {
-                        final turn = _turns[i];
+                        final item = items[i];
+                        if (item.thinkingStatus != null) {
+                          return _ThinkingBubble(
+                            status: item.thinkingStatus!,
+                          );
+                        }
+                        final turn = item.turn!;
                         return _Bubble(
                           turn: turn,
                           onLongPress: () => _copy(turn.content),
@@ -288,9 +402,9 @@ class _ChatbotScreenState extends State<ChatbotScreen> {
                       },
                     ),
             ),
-            if (_diagnosis != null && !_extracting)
+            if (_diagnosis != null)
               _QuickActions(
-                disabled: _sending,
+                disabled: chipsDisabled,
                 onExplain: _onExplain,
                 onTreatment: _onTreatment,
                 onDiagnoseAnother: _onDiagnoseAnother,
@@ -316,16 +430,26 @@ class _ChatbotScreenState extends State<ChatbotScreen> {
                   ],
                 ),
               ),
-            _Composer(
-              controller: _input,
-              onSend: _sendTyped,
-              sending: _sending,
-            ),
+            const SizedBox(height: 8),
           ],
         ),
       ),
     );
   }
+}
+
+/// Discriminated union for the transcript list. Exactly one of [turn] or
+/// [thinkingStatus] is non-null. Saves us juggling two parallel lists in the
+/// state object.
+class _TranscriptItem {
+  const _TranscriptItem._({this.turn, this.thinkingStatus});
+  factory _TranscriptItem.turn(LlmTurn turn) =>
+      _TranscriptItem._(turn: turn);
+  factory _TranscriptItem.thinking(String status) =>
+      _TranscriptItem._(thinkingStatus: status);
+
+  final LlmTurn? turn;
+  final String? thinkingStatus;
 }
 
 /// Top-of-chat preview of the cropped leaf. Capped at 1/3 of screen height
@@ -460,9 +584,119 @@ class _Bubble extends StatelessWidget {
   }
 }
 
+/// Assistant-side "thinking" bubble. Shows the current rotating-status line
+/// plus an animated three-dot indicator so the user can tell work is still
+/// in flight even between status swaps.
+class _ThinkingBubble extends StatelessWidget {
+  const _ThinkingBubble({required this.status});
+  final String status;
+
+  @override
+  Widget build(BuildContext context) {
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Container(
+        margin: const EdgeInsets.symmetric(vertical: 4),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        constraints: BoxConstraints(
+          maxWidth: MediaQuery.of(context).size.width * 0.78,
+        ),
+        decoration: BoxDecoration(
+          color: const Color(0xFF1E1E1E),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: Colors.white12),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const _TypingDots(),
+            const SizedBox(width: 10),
+            Flexible(
+              child: AnimatedSwitcher(
+                duration: const Duration(milliseconds: 280),
+                transitionBuilder: (child, anim) =>
+                    FadeTransition(opacity: anim, child: child),
+                child: Text(
+                  status,
+                  key: ValueKey(status),
+                  style: const TextStyle(
+                    color: Colors.white70,
+                    fontSize: 14,
+                    height: 1.35,
+                    fontStyle: FontStyle.italic,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Three-dot animated indicator that bounces with a staggered phase. Used in
+/// the thinking bubble alongside the rotating status text.
+class _TypingDots extends StatefulWidget {
+  const _TypingDots();
+  @override
+  State<_TypingDots> createState() => _TypingDotsState();
+}
+
+class _TypingDotsState extends State<_TypingDots>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1100),
+    )..repeat();
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _controller,
+      builder: (_, __) {
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: List.generate(3, (i) {
+            final phase = (_controller.value - i * 0.18) % 1.0;
+            final scale = 0.6 + 0.6 * (1 - (phase * 2 - 1).abs()).clamp(0, 1);
+            return Padding(
+              padding: EdgeInsets.only(right: i == 2 ? 0 : 4),
+              child: Transform.scale(
+                scale: scale,
+                child: Container(
+                  width: 6,
+                  height: 6,
+                  decoration: const BoxDecoration(
+                    color: Colors.lightBlueAccent,
+                    shape: BoxShape.circle,
+                  ),
+                ),
+              ),
+            );
+          }),
+        );
+      },
+    );
+  }
+}
+
 /// Row of pressable "chat bubble" chips below the transcript. Surfaced once
 /// the assistant has produced a parseable `Diagnosis: …` line so the user
-/// has obvious follow-ups instead of an empty composer.
+/// has obvious follow-ups — this is the only way the user can drive the
+/// conversation forward (free-form text input is intentionally disabled).
 class _QuickActions extends StatelessWidget {
   const _QuickActions({
     required this.disabled,
@@ -547,119 +781,6 @@ class _ActionChip extends StatelessWidget {
               ),
             ],
           ),
-        ),
-      ),
-    );
-  }
-}
-
-class _Composer extends StatelessWidget {
-  const _Composer({
-    required this.controller,
-    required this.onSend,
-    required this.sending,
-  });
-
-  final TextEditingController controller;
-  final VoidCallback onSend;
-  final bool sending;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
-      decoration: const BoxDecoration(
-        color: Colors.black,
-        border: Border(top: BorderSide(color: Colors.white12)),
-      ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.end,
-        children: [
-          Expanded(
-            child: TextField(
-              controller: controller,
-              minLines: 1,
-              maxLines: 5,
-              enabled: !sending,
-              textCapitalization: TextCapitalization.sentences,
-              style: const TextStyle(color: Colors.white, fontSize: 14),
-              decoration: InputDecoration(
-                hintText: sending ? 'Thinking…' : 'Ask about this leaf…',
-                hintStyle: const TextStyle(color: Colors.white38),
-                filled: true,
-                fillColor: const Color(0xFF1A1A1A),
-                contentPadding: const EdgeInsets.symmetric(
-                    horizontal: 14, vertical: 10),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(20),
-                  borderSide: BorderSide.none,
-                ),
-              ),
-              onSubmitted: (_) => onSend(),
-            ),
-          ),
-          const SizedBox(width: 8),
-          SizedBox(
-            width: 44,
-            height: 44,
-            child: ElevatedButton(
-              onPressed: sending ? null : onSend,
-              style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.white,
-                foregroundColor: Colors.black,
-                shape: const CircleBorder(),
-                padding: EdgeInsets.zero,
-              ),
-              child: sending
-                  ? const SizedBox(
-                      width: 18,
-                      height: 18,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2,
-                        color: Colors.black,
-                      ),
-                    )
-                  : const Icon(Icons.send, size: 20),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _EmptyState extends StatelessWidget {
-  const _EmptyState({required this.extracting});
-  final bool extracting;
-
-  @override
-  Widget build(BuildContext context) {
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(Icons.smart_toy_outlined,
-                color: Colors.white24, size: 64),
-            const SizedBox(height: 12),
-            Text(
-              extracting
-                  ? 'Locating the central leaf…'
-                  : 'Asking the agronomist for a diagnosis…',
-              style: const TextStyle(color: Colors.white70, fontSize: 14),
-              textAlign: TextAlign.center,
-            ),
-            const SizedBox(height: 12),
-            const SizedBox(
-              width: 22,
-              height: 22,
-              child: CircularProgressIndicator(
-                strokeWidth: 2,
-                color: Colors.white38,
-              ),
-            ),
-          ],
         ),
       ),
     );

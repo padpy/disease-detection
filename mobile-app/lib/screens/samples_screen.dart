@@ -1246,7 +1246,7 @@ class _SampleJobStatusRow extends StatelessWidget {
               const SizedBox(width: 4),
               Text(
                 '${status.detectionCount} $noun '
-                '· ${status.elapsed.inMilliseconds} ms',
+                '· ${status.elapsed.inSeconds} s',
                 style: const TextStyle(
                     color: Colors.greenAccent, fontSize: 12),
               ),
