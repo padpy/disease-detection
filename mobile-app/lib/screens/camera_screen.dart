@@ -648,13 +648,25 @@ class _CameraPreview extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final size = MediaQuery.of(context).size;
-    final scale = size.aspectRatio * controller.value.aspectRatio;
+    final previewSize = controller.value.previewSize;
+    if (previewSize == null) {
+      return const ColoredBox(color: Colors.black);
+    }
+    // previewSize is reported in sensor (landscape) coordinates:
+    // .width is the long side, .height is the short side. Swap when the
+    // device is in portrait so FittedBox sees the on-screen aspect ratio.
+    final isPortrait =
+        MediaQuery.orientationOf(context) == Orientation.portrait;
+    final displayWidth = isPortrait ? previewSize.height : previewSize.width;
+    final displayHeight = isPortrait ? previewSize.width : previewSize.height;
     return ClipRect(
-      child: Transform.scale(
-        scale: scale < 1 ? 1 / scale : scale,
-        alignment: Alignment.center,
-        child: CameraPreview(controller),
+      child: FittedBox(
+        fit: BoxFit.cover,
+        child: SizedBox(
+          width: displayWidth,
+          height: displayHeight,
+          child: CameraPreview(controller),
+        ),
       ),
     );
   }
