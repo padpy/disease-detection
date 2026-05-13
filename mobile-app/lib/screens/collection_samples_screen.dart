@@ -1,12 +1,9 @@
-import 'dart:io';
-
 import 'package:flutter/material.dart';
 import 'package:gopher_eye/model/collection.dart';
 import 'package:gopher_eye/model/sample.dart';
 import 'package:gopher_eye/screens/samples_screen.dart';
 import 'package:gopher_eye/services/detection_service.dart';
 import 'package:gopher_eye/services/sample_repository.dart';
-import 'package:url_launcher/url_launcher.dart';
 
 /// Drill-in screen for a single [Collection]. Reuses [SampleTile] +
 /// [SampleViewerScreen] from the main samples screen so the in-collection
@@ -109,18 +106,6 @@ class _CollectionSamplesScreenState extends State<CollectionSamplesScreen> {
     return result ?? false;
   }
 
-  Future<void> _openMaps(Sample sample) async {
-    if (!sample.hasLocation) return;
-    final lat = sample.latitude!;
-    final lng = sample.longitude!;
-    final uri = Platform.isIOS
-        ? Uri.parse('https://maps.apple.com/?ll=$lat,$lng&q=Sample')
-        : Uri.parse('geo:$lat,$lng?q=$lat,$lng(Sample)');
-    if (await canLaunchUrl(uri)) {
-      await launchUrl(uri, mode: LaunchMode.externalApplication);
-    }
-  }
-
   Future<void> _openViewer(Sample sample) async {
     await Navigator.of(context).push(
       MaterialPageRoute(builder: (_) => SampleViewerScreen(sample: sample)),
@@ -199,7 +184,6 @@ class _CollectionSamplesScreenState extends State<CollectionSamplesScreen> {
                   onLongPress: () async {
                     if (await _confirmDelete(sample)) await _delete(sample);
                   },
-                  onCoordsTap: () => _openMaps(sample),
                 ),
               );
             },

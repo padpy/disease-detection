@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
@@ -8,6 +9,7 @@ import 'package:gopher_eye/screens/instance_editor_screen.dart';
 import 'package:gopher_eye/services/grape_leaf_pipeline.dart' show grapeLeafDisplayLabel;
 import 'package:gopher_eye/services/sample_repository.dart';
 import 'package:gopher_eye/widgets/sample_tag_edit_dialog.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 /// What [InstanceInspectorScreen] returns to its caller. The inspector can
 /// surface two independent kinds of edits in one visit (the instance editor
@@ -59,13 +61,32 @@ class InstanceInspectorScreen extends StatefulWidget {
       _InstanceInspectorScreenState();
 }
 
+/// Three preview states for the inspector's instance tile: the raw cropped
+/// photo, the segmentation outline, or the disease classification overlay.
+/// "Off" lets the user inspect the raw pixels without any annotation.
+enum _PreviewMode { off, segmentation, disease }
+
 class _InstanceInspectorScreenState extends State<InstanceInspectorScreen> {
   late SampleInstance _instance = widget.instance;
   late Sample _sample = widget.sample;
   Sample? _sampleEdit; // non-null once the user has saved a QR edit
-  bool _showDisease = false;
+  late _PreviewMode _previewMode = widget.instance.diseasePreviewPng != null
+      ? _PreviewMode.disease
+      : _PreviewMode.segmentation;
   bool _busy = false;
   String? _error;
+
+  Future<void> _openMaps() async {
+    if (!_sample.hasLocation) return;
+    final lat = _sample.latitude!;
+    final lng = _sample.longitude!;
+    final uri = Platform.isIOS
+        ? Uri.parse('https://maps.apple.com/?ll=$lat,$lng&q=Sample')
+        : Uri.parse('geo:$lat,$lng?q=$lat,$lng(Sample)');
+    if (await canLaunchUrl(uri)) {
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+    }
+  }
 
   void _popWithResult(InstanceEditorResult? editorResult) {
     final result = InspectorResult(
@@ -259,9 +280,6 @@ class _InstanceInspectorScreenState extends State<InstanceInspectorScreen> {
   }
 
   Widget _buildPreview() {
-    final png = (_showDisease && _instance.diseasePreviewPng != null)
-        ? _instance.diseasePreviewPng!
-        : _instance.previewPng;
     return ClipRRect(
       borderRadius: BorderRadius.circular(8),
       child: AspectRatio(
@@ -269,11 +287,24 @@ class _InstanceInspectorScreenState extends State<InstanceInspectorScreen> {
         child: InteractiveViewer(
           minScale: 1,
           maxScale: 5,
-          child: Image.memory(
-            png,
-            gaplessPlayback: true,
-            fit: BoxFit.contain,
-          ),
+          child: switch (_previewMode) {
+            _PreviewMode.off => _RawBboxCrop(
+                workingPng: widget.workingPng,
+                workingWidth: widget.workingWidth,
+                workingHeight: widget.workingHeight,
+                bbox: _instance.bbox,
+              ),
+            _PreviewMode.segmentation => Image.memory(
+                _instance.previewPng,
+                gaplessPlayback: true,
+                fit: BoxFit.contain,
+              ),
+            _PreviewMode.disease => Image.memory(
+                _instance.diseasePreviewPng ?? _instance.previewPng,
+                gaplessPlayback: true,
+                fit: BoxFit.contain,
+              ),
+          },
         ),
       ),
     );
@@ -281,23 +312,28 @@ class _InstanceInspectorScreenState extends State<InstanceInspectorScreen> {
 
   Widget _buildPreviewToggle() {
     final hasDisease = _instance.diseasePreviewPng != null;
-    return SegmentedButton<bool>(
+    return SegmentedButton<_PreviewMode>(
       showSelectedIcon: false,
       segments: [
         const ButtonSegment(
-          value: false,
+          value: _PreviewMode.off,
+          label: Text('Off'),
+          icon: Icon(Icons.visibility_off_outlined),
+        ),
+        const ButtonSegment(
+          value: _PreviewMode.segmentation,
           label: Text('Segment'),
           icon: Icon(Icons.gesture),
         ),
         ButtonSegment(
-          value: true,
+          value: _PreviewMode.disease,
           label: const Text('Disease'),
           icon: const Icon(Icons.local_florist),
           enabled: hasDisease,
         ),
       ],
-      selected: {_showDisease},
-      onSelectionChanged: (s) => setState(() => _showDisease = s.first),
+      selected: {_previewMode},
+      onSelectionChanged: (s) => setState(() => _previewMode = s.first),
       style: ButtonStyle(
         foregroundColor: WidgetStateProperty.resolveWith(
             (s) => s.contains(WidgetState.selected)
@@ -405,6 +441,15 @@ class _InstanceInspectorScreenState extends State<InstanceInspectorScreen> {
           const _SectionHeader(title: 'Disease analysis'),
           ...fhbRows,
         ],
+        if (_sample.hasLocation) ...[
+          const SizedBox(height: 16),
+          const _SectionHeader(title: 'GPS'),
+          _GpsRow(
+            latitude: _sample.latitude!,
+            longitude: _sample.longitude!,
+            onTap: _busy ? null : _openMaps,
+          ),
+        ],
         if (canEditTag) ...[
           const SizedBox(height: 16),
           _SectionHeader(
@@ -437,6 +482,114 @@ class _InstanceInspectorScreenState extends State<InstanceInspectorScreen> {
             ...qrRows,
         ],
       ],
+    );
+  }
+}
+
+/// Shows the sample's captured GPS coordinates with a "Open in Maps" link.
+/// The samples list intentionally renders coords as static text, so this
+/// inspector is the only place in the app where tapping launches the
+/// platform maps app.
+class _GpsRow extends StatelessWidget {
+  const _GpsRow({
+    required this.latitude,
+    required this.longitude,
+    required this.onTap,
+  });
+
+  final double latitude;
+  final double longitude;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: GestureDetector(
+        onTap: onTap,
+        behavior: HitTestBehavior.opaque,
+        child: Row(
+          children: [
+            const SizedBox(
+              width: 110,
+              child: Text(
+                'Location',
+                style: TextStyle(color: Colors.white54, fontSize: 13),
+              ),
+            ),
+            const Icon(
+              Icons.place_outlined,
+              size: 14,
+              color: Colors.lightBlueAccent,
+            ),
+            const SizedBox(width: 4),
+            Expanded(
+              child: Text(
+                '${latitude.toStringAsFixed(5)}, ${longitude.toStringAsFixed(5)}',
+                style: const TextStyle(
+                  color: Colors.lightBlueAccent,
+                  fontSize: 13,
+                  decoration: TextDecoration.underline,
+                ),
+              ),
+            ),
+            const Icon(
+              Icons.open_in_new,
+              size: 14,
+              color: Colors.lightBlueAccent,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Renders only the bbox region of the working image, with no overlay drawn on
+/// top. Used when the inspector's preview-mode toggle is set to "Off" so the
+/// user can inspect the raw pixels without segmentation or disease coloring
+/// occluding them. The working image is positioned/scaled so the requested
+/// bbox fills the available width.
+class _RawBboxCrop extends StatelessWidget {
+  const _RawBboxCrop({
+    required this.workingPng,
+    required this.workingWidth,
+    required this.workingHeight,
+    required this.bbox,
+  });
+
+  final Uint8List workingPng;
+  final int workingWidth;
+  final int workingHeight;
+  final Rect bbox;
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final scale = constraints.maxWidth / bbox.width;
+        return ClipRect(
+          child: OverflowBox(
+            minWidth: 0,
+            maxWidth: double.infinity,
+            minHeight: 0,
+            maxHeight: double.infinity,
+            alignment: Alignment.topLeft,
+            child: Transform.translate(
+              offset: Offset(-bbox.left * scale, -bbox.top * scale),
+              child: SizedBox(
+                width: workingWidth * scale,
+                height: workingHeight * scale,
+                child: Image.memory(
+                  workingPng,
+                  fit: BoxFit.fill,
+                  gaplessPlayback: true,
+                ),
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
 }

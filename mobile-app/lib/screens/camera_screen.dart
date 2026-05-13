@@ -219,6 +219,19 @@ class _CameraScreenState extends State<CameraScreen>
     } catch (_) {}
   }
 
+  Future<void> _setZoom(double level) async {
+    final controller = _controller;
+    if (controller == null || !controller.value.isInitialized) return;
+    final clamped = level.clamp(_minZoom, _maxZoom);
+    try {
+      await controller.setZoomLevel(clamped);
+      if (mounted) {
+        setState(() => _zoom = clamped);
+        _showZoomIndicator();
+      }
+    } catch (_) {}
+  }
+
   Future<void> _flipCamera() async {
     if (_switching || _cameras.length < 2) return;
     _switching = true;
@@ -609,6 +622,12 @@ class _CameraScreenState extends State<CameraScreen>
                     child: _ChatbotModeChip(),
                   ),
                 const Spacer(),
+                _LensPresetBar(
+                  zoom: _zoom,
+                  minZoom: _minZoom,
+                  maxZoom: _maxZoom,
+                  onSelect: _setZoom,
+                ),
                 _BottomBar(
                   onCapture: _capture,
                   onPickGallery: _pickFromGallery,
@@ -1216,6 +1235,106 @@ class _CircleIconButton extends StatelessWidget {
           icon,
           color: highlighted ? Colors.black : Colors.white,
           size: size * 0.5,
+        ),
+      ),
+    );
+  }
+}
+
+/// Horizontal row of lens-preset chips (e.g. `.5x`, `1x`, `2x`, `5x`). Each
+/// chip sets the camera's zoom level to that focal-length multiplier; on
+/// iOS this also triggers the OS-level lens swap between physical cameras
+/// (ultra-wide, wide, tele). Presets outside the current camera's reported
+/// zoom range are filtered out so we never offer an unreachable level.
+class _LensPresetBar extends StatelessWidget {
+  const _LensPresetBar({
+    required this.zoom,
+    required this.minZoom,
+    required this.maxZoom,
+    required this.onSelect,
+  });
+
+  final double zoom;
+  final double minZoom;
+  final double maxZoom;
+  final ValueChanged<double> onSelect;
+
+  static const List<double> _candidates = [0.5, 1.0, 2.0, 5.0, 10.0];
+
+  @override
+  Widget build(BuildContext context) {
+    final presets = _candidates
+        .where((p) => p >= minZoom - 0.01 && p <= maxZoom + 0.01)
+        .toList();
+    // Always offer the camera's true min if it falls below our smallest preset
+    // (some sensors report 0.6x rather than 0.5x).
+    if (presets.isEmpty || (presets.first - minZoom).abs() > 0.05) {
+      if (minZoom < (presets.isEmpty ? 1.0 : presets.first)) {
+        presets.insert(0, minZoom);
+      }
+    }
+    if (presets.length < 2) return const SizedBox(height: 0);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          for (final level in presets) ...[
+            _LensChip(
+              level: level,
+              active: (zoom - level).abs() < 0.15,
+              onTap: () => onSelect(level),
+            ),
+            const SizedBox(width: 8),
+          ],
+        ]..removeLast(),
+      ),
+    );
+  }
+}
+
+class _LensChip extends StatelessWidget {
+  const _LensChip({
+    required this.level,
+    required this.active,
+    required this.onTap,
+  });
+
+  final double level;
+  final bool active;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final label = level < 1.0
+        ? '.${(level * 10).round()}x'
+        : (level == level.roundToDouble()
+            ? '${level.toInt()}x'
+            : '${level.toStringAsFixed(1)}x');
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 150),
+        padding: EdgeInsets.symmetric(
+          horizontal: active ? 12 : 10,
+          vertical: active ? 8 : 6,
+        ),
+        decoration: BoxDecoration(
+          color: active ? Colors.white : Colors.black54,
+          shape: BoxShape.rectangle,
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(
+            color: active ? Colors.amberAccent : Colors.white24,
+            width: 1.2,
+          ),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            color: active ? Colors.black : Colors.white,
+            fontSize: active ? 13 : 12,
+            fontWeight: FontWeight.w700,
+          ),
         ),
       ),
     );

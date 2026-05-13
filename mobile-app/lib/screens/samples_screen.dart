@@ -15,7 +15,6 @@ import 'package:gopher_eye/services/detection_service.dart';
 import 'package:gopher_eye/services/grape_leaf_pipeline.dart';
 import 'package:gopher_eye/services/sample_repository.dart';
 import 'package:gopher_eye/widgets/sample_tag_edit_dialog.dart';
-import 'package:url_launcher/url_launcher.dart';
 
 class SamplesScreen extends StatefulWidget {
   const SamplesScreen({super.key, this.onBack});
@@ -200,18 +199,6 @@ class _SamplesScreenState extends State<SamplesScreen> {
     return result ?? false;
   }
 
-  Future<void> _openMaps(Sample sample) async {
-    if (!sample.hasLocation) return;
-    final lat = sample.latitude!;
-    final lng = sample.longitude!;
-    final uri = Platform.isIOS
-        ? Uri.parse('https://maps.apple.com/?ll=$lat,$lng&q=Sample')
-        : Uri.parse('geo:$lat,$lng?q=$lat,$lng(Sample)');
-    if (await canLaunchUrl(uri)) {
-      await launchUrl(uri, mode: LaunchMode.externalApplication);
-    }
-  }
-
   void _openViewer(Sample sample) {
     Navigator.of(context).push(
       MaterialPageRoute(builder: (_) => SampleViewerScreen(sample: sample)),
@@ -312,7 +299,6 @@ class _SamplesScreenState extends State<SamplesScreen> {
                   onLongPress: () async {
                     if (await _confirmDelete(sample)) await _delete(sample);
                   },
-                  onCoordsTap: () => _openMaps(sample),
                 ),
               );
             },
@@ -448,13 +434,11 @@ class SampleTile extends StatelessWidget {
     required this.sample,
     required this.onTap,
     required this.onLongPress,
-    required this.onCoordsTap,
   });
 
   final Sample sample;
   final VoidCallback onTap;
   final VoidCallback onLongPress;
-  final VoidCallback onCoordsTap;
 
   @override
   Widget build(BuildContext context) {
@@ -507,27 +491,22 @@ class SampleTile extends StatelessWidget {
                   ),
                   const SizedBox(height: 4),
                   if (sample.hasLocation)
-                    GestureDetector(
-                      onTap: onCoordsTap,
-                      behavior: HitTestBehavior.opaque,
-                      child: Row(
-                        children: [
-                          const Icon(
-                            Icons.place_outlined,
-                            size: 14,
-                            color: Colors.lightBlueAccent,
+                    Row(
+                      children: [
+                        const Icon(
+                          Icons.place_outlined,
+                          size: 14,
+                          color: Colors.white54,
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          '${sample.latitude!.toStringAsFixed(4)}, ${sample.longitude!.toStringAsFixed(4)}',
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 13,
                           ),
-                          const SizedBox(width: 4),
-                          Text(
-                            '${sample.latitude!.toStringAsFixed(4)}, ${sample.longitude!.toStringAsFixed(4)}',
-                            style: const TextStyle(
-                              color: Colors.lightBlueAccent,
-                              fontSize: 13,
-                              decoration: TextDecoration.underline,
-                            ),
-                          ),
-                        ],
-                      ),
+                        ),
+                      ],
                     )
                   else
                     const Text(
@@ -613,7 +592,7 @@ enum _OverlayMode { bbox, segmentation, disease }
 class _SampleViewerScreenState extends State<SampleViewerScreen> {
   String? _error;
   bool _showOverlay = true;
-  _OverlayMode _overlayMode = _OverlayMode.segmentation;
+  _OverlayMode _overlayMode = _OverlayMode.disease;
 
   /// Local copy so we can reflect mode switches without leaving the screen.
   late Sample _sample = widget.sample;
@@ -980,6 +959,30 @@ class _SampleViewerScreenState extends State<SampleViewerScreen> {
 
   bool get _hasInstances => _instances.isNotEmpty;
 
+  void _openFullscreen({
+    required bool inDiseaseMode,
+    required bool inSegmentationMode,
+  }) {
+    final initial = inDiseaseMode
+        ? _OverlayMode.disease
+        : (inSegmentationMode ? _OverlayMode.segmentation : _OverlayMode.bbox);
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => _FullscreenSampleViewer(
+          imagePath: _sample.filePath,
+          instances: _instances,
+          workingWidth: _workingW ?? 1,
+          workingHeight: _workingH ?? 1,
+          segmentationOverlayPng: _segmentationOverlayPng,
+          diseaseOverlayPng: _diseaseOverlayPng,
+          initialMode: initial,
+          hasDisease: _hasDiseaseData,
+          hasInstances: _hasInstances,
+        ),
+      ),
+    );
+  }
+
   /// Pick the right overlay layer for the current mode. Both PNG-based
   /// overlays (segmentation, disease) are at working-image resolution, so
   /// they're stretched to fit the displayed original via `BoxFit.fill`. The
@@ -1029,6 +1032,15 @@ class _SampleViewerScreenState extends State<SampleViewerScreen> {
           style: const TextStyle(color: Colors.white, fontSize: 15),
         ),
         actions: [
+          if (hasWorking)
+            IconButton(
+              tooltip: 'Fullscreen',
+              icon: const Icon(Icons.fullscreen, color: Colors.white),
+              onPressed: () => _openFullscreen(
+                inDiseaseMode: inDiseaseMode,
+                inSegmentationMode: inSegmentationMode,
+              ),
+            ),
           _ViewerModeChip(mode: _sample.detectionMode, onPick: _pickMode),
         ],
       ),
@@ -1169,6 +1181,149 @@ class _SampleViewerScreenState extends State<SampleViewerScreen> {
           ],
         ),
       ),
+    );
+  }
+}
+
+/// Full-screen sample image inspector with seg/disease overlay toggles. The
+/// regular [SampleViewerScreen] packs the image alongside the instance strip,
+/// collection panel, etc.; this view drops all of that chrome so the user can
+/// pan and zoom into the raw photo. The overlay toggle in the bottom action
+/// bar mirrors the in-screen toggle so users keep the same mental model.
+class _FullscreenSampleViewer extends StatefulWidget {
+  const _FullscreenSampleViewer({
+    required this.imagePath,
+    required this.instances,
+    required this.workingWidth,
+    required this.workingHeight,
+    required this.segmentationOverlayPng,
+    required this.diseaseOverlayPng,
+    required this.initialMode,
+    required this.hasDisease,
+    required this.hasInstances,
+  });
+
+  final String imagePath;
+  final List<SampleInstance> instances;
+  final int workingWidth;
+  final int workingHeight;
+  final Uint8List? segmentationOverlayPng;
+  final Uint8List? diseaseOverlayPng;
+  final _OverlayMode initialMode;
+  final bool hasDisease;
+  final bool hasInstances;
+
+  @override
+  State<_FullscreenSampleViewer> createState() =>
+      _FullscreenSampleViewerState();
+}
+
+class _FullscreenSampleViewerState extends State<_FullscreenSampleViewer> {
+  late _OverlayMode _mode = widget.initialMode;
+  bool _showOverlay = true;
+
+  @override
+  Widget build(BuildContext context) {
+    final aspect = widget.workingWidth / widget.workingHeight;
+    final inDisease = _mode == _OverlayMode.disease && widget.hasDisease;
+    final inSegmentation =
+        _mode == _OverlayMode.segmentation && widget.hasInstances;
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.black,
+        iconTheme: const IconThemeData(color: Colors.white),
+        title: const Text(
+          'Sample',
+          style: TextStyle(color: Colors.white, fontSize: 15),
+        ),
+        actions: [
+          IconButton(
+            tooltip: _showOverlay ? 'Hide overlay' : 'Show overlay',
+            icon: Icon(
+              _showOverlay ? Icons.visibility : Icons.visibility_off,
+              color: Colors.white,
+            ),
+            onPressed: () => setState(() => _showOverlay = !_showOverlay),
+          ),
+        ],
+      ),
+      body: SafeArea(
+        child: Column(
+          children: [
+            Expanded(
+              child: Center(
+                child: InteractiveViewer(
+                  minScale: 1,
+                  maxScale: 8,
+                  child: AspectRatio(
+                    aspectRatio: aspect,
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        Image.file(
+                          File(widget.imagePath),
+                          gaplessPlayback: true,
+                          fit: BoxFit.fill,
+                          cacheWidth: 4096,
+                          errorBuilder: (_, __, ___) => const Icon(
+                            Icons.broken_image_outlined,
+                            color: Colors.white54,
+                            size: 64,
+                          ),
+                        ),
+                        if (_showOverlay && widget.hasInstances)
+                          _fullscreenOverlay(
+                            inDisease: inDisease,
+                            inSegmentation: inSegmentation,
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            if (widget.hasInstances)
+              Padding(
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 16, vertical: 12),
+                child: _OverlayModeToggle(
+                  mode: _mode,
+                  hasDisease: widget.hasDisease,
+                  onChanged: (m) => setState(() {
+                    _mode = m;
+                    _showOverlay = true;
+                  }),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _fullscreenOverlay({
+    required bool inDisease,
+    required bool inSegmentation,
+  }) {
+    if (inDisease && widget.diseaseOverlayPng != null) {
+      return Image.memory(
+        widget.diseaseOverlayPng!,
+        gaplessPlayback: true,
+        fit: BoxFit.fill,
+      );
+    }
+    if (inSegmentation && widget.segmentationOverlayPng != null) {
+      return Image.memory(
+        widget.segmentationOverlayPng!,
+        gaplessPlayback: true,
+        fit: BoxFit.fill,
+      );
+    }
+    return _BboxOverlay(
+      instances: widget.instances,
+      width: widget.workingWidth,
+      height: widget.workingHeight,
     );
   }
 }
