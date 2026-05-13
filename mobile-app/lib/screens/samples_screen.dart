@@ -7,7 +7,6 @@ import 'package:gopher_eye/model/detection_mode.dart';
 import 'package:gopher_eye/model/sample.dart';
 import 'package:gopher_eye/model/sample_instance.dart';
 import 'package:gopher_eye/screens/collection_picker_screen.dart';
-import 'package:gopher_eye/screens/collection_samples_screen.dart';
 import 'package:gopher_eye/screens/export_screen.dart';
 import 'package:gopher_eye/screens/instance_editor_screen.dart';
 import 'package:gopher_eye/screens/instance_inspector_screen.dart';
@@ -25,57 +24,71 @@ class SamplesScreen extends StatefulWidget {
   State<SamplesScreen> createState() => _SamplesScreenState();
 }
 
-/// One entry in the grouped samples list. Either a collection (which opens
-/// its own drill-in screen on tap) or a single uncollected sample.
-sealed class _SamplesListEntry {
-  const _SamplesListEntry();
-  DateTime get sortKey;
-}
+/// Sentinel used as the "collection id" of the uncollected bucket so the
+/// expand-state set and the samples-by-collection map can share one key
+/// space without juggling `null` checks at every call site.
+const int _kUncollectedKey = -1;
 
-class _CollectionEntry extends _SamplesListEntry {
-  const _CollectionEntry({
+/// A collection plus its samples, prepared for rendering as one expandable
+/// section in the grouped samples list. The same shape is used for the
+/// synthetic "Uncollected" bucket — its [collection] is `null` and its id
+/// is [_kUncollectedKey].
+class _CollectionGroup {
+  _CollectionGroup({
+    required this.id,
     required this.collection,
-    required this.sampleCount,
-    required this.lastSampleAt,
-    this.coverImagePath,
+    required this.samples,
   });
 
-  final Collection collection;
-  final int sampleCount;
+  final int id;
+  final Collection? collection;
+  final List<Sample> samples;
 
-  /// Most recent capture in the collection, or the collection's createdAt
-  /// when empty. Used for the entry's secondary line and as the sort key so
-  /// active collections float to the top.
-  final DateTime lastSampleAt;
-  final String? coverImagePath;
+  bool get isUncollected => collection == null;
+  String get displayName => collection?.name ?? 'Uncollected';
 
-  @override
-  DateTime get sortKey => lastSampleAt;
-}
+  /// Newest sample's timestamp (groups are sorted by this so the most
+  /// recently active collection floats to the top). Falls back to the
+  /// collection's createdAt for empty collections.
+  DateTime get sortKey => samples.isNotEmpty
+      ? samples.first.takenAt
+      : (collection?.createdAt ?? DateTime.fromMillisecondsSinceEpoch(0));
 
-class _SampleEntry extends _SamplesListEntry {
-  const _SampleEntry(this.sample);
-  final Sample sample;
-
-  @override
-  DateTime get sortKey => sample.takenAt;
+  String? get coverImagePath =>
+      samples.isNotEmpty ? samples.first.filePath : null;
 }
 
 class _SamplesScreenState extends State<SamplesScreen> {
-  late Future<List<_SamplesListEntry>> _future;
-  List<_SamplesListEntry> _entries = [];
+  late Future<void> _future;
+  List<_CollectionGroup> _groups = [];
+
+  /// IDs of collections (and the [_kUncollectedKey] bucket) the user has
+  /// expanded. Persisted across reloads so swipe-deletes don't snap a
+  /// section closed.
+  final Set<int> _expanded = {};
+
+  final TextEditingController _searchCtrl = TextEditingController();
+  String _query = '';
 
   @override
   void initState() {
     super.initState();
+    _searchCtrl.addListener(_onSearchChanged);
     _future = _load();
     DetectionService.instance.addListener(_onAnyJobCompleted);
   }
 
   @override
   void dispose() {
+    _searchCtrl.removeListener(_onSearchChanged);
+    _searchCtrl.dispose();
     DetectionService.instance.removeListener(_onAnyJobCompleted);
     super.dispose();
+  }
+
+  void _onSearchChanged() {
+    if (_searchCtrl.text == _query) return;
+    setState(() => _query = _searchCtrl.text);
   }
 
   void _onAnyJobCompleted() {
@@ -86,7 +99,7 @@ class _SamplesScreenState extends State<SamplesScreen> {
     if (mounted) setState(() {});
   }
 
-  Future<List<_SamplesListEntry>> _load() async {
+  Future<void> _load() async {
     try {
       final repo = SampleRepository.instance;
       final samples = await repo.listAll();
@@ -96,37 +109,35 @@ class _SamplesScreenState extends State<SamplesScreen> {
         '${collections.length} collections',
       );
 
-      // Bucket samples by collection_id so we can build the cover thumb +
-      // count + lastSampleAt without re-querying per collection.
+      // Bucket samples by collection_id (using the sentinel for the
+      // uncollected pile so a single map can hold both kinds).
       final byCollection = <int, List<Sample>>{};
-      final uncollected = <Sample>[];
       for (final s in samples) {
-        if (s.collectionId == null) {
-          uncollected.add(s);
-        } else {
-          (byCollection[s.collectionId!] ??= []).add(s);
-        }
+        final key = s.collectionId ?? _kUncollectedKey;
+        (byCollection[key] ??= []).add(s);
+      }
+      // Newest sample first in each bucket — drives both the cover thumb
+      // and the in-section ordering.
+      for (final list in byCollection.values) {
+        list.sort((a, b) => b.takenAt.compareTo(a.takenAt));
       }
 
-      final entries = <_SamplesListEntry>[
+      final groups = <_CollectionGroup>[
         for (final c in collections)
-          _CollectionEntry(
+          _CollectionGroup(
+            id: c.id!,
             collection: c,
-            sampleCount: byCollection[c.id]?.length ?? 0,
-            lastSampleAt:
-                (byCollection[c.id]?.isNotEmpty ?? false)
-                    ? byCollection[c.id]!.first.takenAt
-                    : c.createdAt,
-            coverImagePath:
-                (byCollection[c.id]?.isNotEmpty ?? false)
-                    ? byCollection[c.id]!.first.filePath
-                    : null,
+            samples: byCollection[c.id] ?? const [],
           ),
-        for (final s in uncollected) _SampleEntry(s),
+        if ((byCollection[_kUncollectedKey] ?? const []).isNotEmpty)
+          _CollectionGroup(
+            id: _kUncollectedKey,
+            collection: null,
+            samples: byCollection[_kUncollectedKey]!,
+          ),
       ]..sort((a, b) => b.sortKey.compareTo(a.sortKey));
 
-      if (mounted) setState(() => _entries = entries);
-      return entries;
+      if (mounted) setState(() => _groups = groups);
     } catch (e, st) {
       debugPrint('[samples] load failed: $e\n$st');
       rethrow;
@@ -135,7 +146,7 @@ class _SamplesScreenState extends State<SamplesScreen> {
 
   void _refresh() {
     setState(() {
-      _entries = [];
+      _groups = [];
       _future = _load();
     });
   }
@@ -145,20 +156,63 @@ class _SamplesScreenState extends State<SamplesScreen> {
     await SampleRepository.instance.delete(sample.id!);
     DetectionService.instance.forget(sample.id!);
     if (!mounted) return;
-    setState(() => _entries.removeWhere(
-        (e) => e is _SampleEntry && e.sample.id == sample.id));
+    setState(() {
+      for (final g in _groups) {
+        g.samples.removeWhere((s) => s.id == sample.id);
+      }
+    });
   }
 
-  Future<void> _openCollection(_CollectionEntry entry) async {
-    await Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) =>
-            CollectionSamplesScreen(collection: entry.collection),
-      ),
-    );
-    // Refresh on return — the user may have reassigned or deleted samples
-    // inside the collection.
-    if (mounted) _refresh();
+  void _toggleExpanded(int id) {
+    setState(() {
+      if (!_expanded.remove(id)) _expanded.add(id);
+    });
+  }
+
+  /// Does this sample match the current query? Checks date string + every
+  /// QR-tag field so the search bar covers "find the rep 3 sample" /
+  /// "find anything tagged with ID-42" use cases without a dedicated UI.
+  bool _sampleMatchesQuery(Sample s, String query) {
+    if (query.isEmpty) return true;
+    final q = query.toLowerCase();
+    if (_formatDate(s.takenAt).toLowerCase().contains(q)) return true;
+    for (final field in [
+      s.qrId,
+      s.qrLine,
+      s.qrRep,
+      s.qrLocation,
+      s.qrNote,
+    ]) {
+      if (field != null && field.toLowerCase().contains(q)) return true;
+    }
+    return false;
+  }
+
+  /// Build the list of groups to render given the active search query. A
+  /// group passes when its name matches OR at least one of its samples
+  /// matches; non-matching samples inside an otherwise-matching collection
+  /// are filtered out so the user sees only relevant rows.
+  List<_CollectionGroup> _visibleGroups() {
+    final q = _query.trim().toLowerCase();
+    if (q.isEmpty) return _groups;
+    final out = <_CollectionGroup>[];
+    for (final g in _groups) {
+      final nameMatches = g.displayName.toLowerCase().contains(q);
+      if (nameMatches) {
+        out.add(g);
+        continue;
+      }
+      final matchingSamples =
+          g.samples.where((s) => _sampleMatchesQuery(s, q)).toList();
+      if (matchingSamples.isNotEmpty) {
+        out.add(_CollectionGroup(
+          id: g.id,
+          collection: g.collection,
+          samples: matchingSamples,
+        ));
+      }
+    }
+    return out;
   }
 
   Future<bool> _confirmDelete(Sample sample) async {
@@ -199,10 +253,13 @@ class _SamplesScreenState extends State<SamplesScreen> {
     return result ?? false;
   }
 
-  void _openViewer(Sample sample) {
-    Navigator.of(context).push(
+  Future<void> _openViewer(Sample sample) async {
+    await Navigator.of(context).push(
       MaterialPageRoute(builder: (_) => SampleViewerScreen(sample: sample)),
     );
+    // The viewer can reassign a sample to a different collection (or clear
+    // it). Reload so the section a sample lives under reflects the change.
+    if (mounted) _refresh();
   }
 
   Future<void> _openExport() async {
@@ -238,80 +295,200 @@ class _SamplesScreenState extends State<SamplesScreen> {
           ),
         ],
       ),
-      body: FutureBuilder<List<_SamplesListEntry>>(
-        future: _future,
-        builder: (context, snapshot) {
-          if (snapshot.connectionState == ConnectionState.waiting) {
-            return const Center(
-              child: CircularProgressIndicator(color: Colors.white),
-            );
-          }
-          if (snapshot.hasError) {
-            return Padding(
-              padding: const EdgeInsets.all(24),
-              child: Center(
-                child: Text(
-                  'Failed to load samples:\n${snapshot.error}',
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(color: Colors.redAccent),
-                ),
+      body: SafeArea(
+        child: Column(
+          children: [
+            _CollectionSearchField(
+              controller: _searchCtrl,
+              onClear: () => _searchCtrl.clear(),
+            ),
+            Expanded(
+              child: FutureBuilder<void>(
+                future: _future,
+                builder: (context, snapshot) {
+                  if (snapshot.connectionState == ConnectionState.waiting &&
+                      _groups.isEmpty) {
+                    return const Center(
+                      child: CircularProgressIndicator(color: Colors.white),
+                    );
+                  }
+                  if (snapshot.hasError) {
+                    return Padding(
+                      padding: const EdgeInsets.all(24),
+                      child: Center(
+                        child: Text(
+                          'Failed to load samples:\n${snapshot.error}',
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(color: Colors.redAccent),
+                        ),
+                      ),
+                    );
+                  }
+                  if (_groups.isEmpty) {
+                    return const Center(
+                      child: Text(
+                        'No samples yet — capture some plants',
+                        style: TextStyle(color: Colors.white70),
+                      ),
+                    );
+                  }
+                  final visible = _visibleGroups();
+                  if (visible.isEmpty) {
+                    return const Center(
+                      child: Text(
+                        'No collections or samples match',
+                        style: TextStyle(color: Colors.white54),
+                      ),
+                    );
+                  }
+                  // When searching, auto-expand any group with matching
+                  // samples so results are visible without an extra tap.
+                  final searching = _query.trim().isNotEmpty;
+                  return ListView.builder(
+                    itemCount: visible.length,
+                    itemBuilder: (context, index) {
+                      final group = visible[index];
+                      final expanded =
+                          searching || _expanded.contains(group.id);
+                      return _CollectionSection(
+                        group: group,
+                        expanded: expanded,
+                        onToggle: () => _toggleExpanded(group.id),
+                        onOpenSample: _openViewer,
+                        onConfirmDelete: _confirmDelete,
+                        onDelete: _delete,
+                      );
+                    },
+                  );
+                },
               ),
-            );
-          }
-          if (_entries.isEmpty) {
-            return const Center(
-              child: Text(
-                'No samples yet — capture some plants',
-                style: TextStyle(color: Colors.white70),
-              ),
-            );
-          }
-          return ListView.separated(
-            itemCount: _entries.length,
-            separatorBuilder: (_, __) =>
-                const Divider(height: 1, color: Colors.white12),
-            itemBuilder: (context, index) {
-              final entry = _entries[index];
-              if (entry is _CollectionEntry) {
-                return CollectionTile(
-                  collection: entry.collection,
-                  sampleCount: entry.sampleCount,
-                  lastSampleAt: entry.lastSampleAt,
-                  coverImagePath: entry.coverImagePath,
-                  onTap: () => _openCollection(entry),
-                );
-              }
-              final sample = (entry as _SampleEntry).sample;
-              return Dismissible(
-                key: ValueKey('sample-${sample.id}'),
-                direction: DismissDirection.endToStart,
-                background: Container(
-                  color: Colors.redAccent,
-                  alignment: Alignment.centerRight,
-                  padding: const EdgeInsets.symmetric(horizontal: 24),
-                  child: const Icon(Icons.delete, color: Colors.white),
-                ),
-                confirmDismiss: (_) => _confirmDelete(sample),
-                onDismissed: (_) => _delete(sample),
-                child: SampleTile(
-                  sample: sample,
-                  onTap: () => _openViewer(sample),
-                  onLongPress: () async {
-                    if (await _confirmDelete(sample)) await _delete(sample);
-                  },
-                ),
-              );
-            },
-          );
-        },
+            ),
+          ],
+        ),
       ),
     );
   }
 }
 
-/// Single-row entry for a collection in the samples list. Shows the cover
-/// thumbnail (latest sample image, or placeholder when empty), name, sample
-/// count, and the timestamp of the latest capture.
+/// Search box pinned above the samples list. Matches against collection
+/// names and sample QR-tag fields; see [_SamplesScreenState._sampleMatchesQuery].
+class _CollectionSearchField extends StatelessWidget {
+  const _CollectionSearchField({
+    required this.controller,
+    required this.onClear,
+  });
+
+  final TextEditingController controller;
+  final VoidCallback onClear;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+      child: TextField(
+        controller: controller,
+        style: const TextStyle(color: Colors.white),
+        decoration: InputDecoration(
+          hintText: 'Search collections or samples',
+          hintStyle: const TextStyle(color: Colors.white38),
+          prefixIcon: const Icon(Icons.search, color: Colors.white54),
+          suffixIcon: ValueListenableBuilder<TextEditingValue>(
+            valueListenable: controller,
+            builder: (_, value, __) {
+              if (value.text.isEmpty) return const SizedBox.shrink();
+              return IconButton(
+                icon: const Icon(Icons.close, color: Colors.white54),
+                onPressed: onClear,
+              );
+            },
+          ),
+          filled: true,
+          fillColor: Colors.white10,
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(10),
+            borderSide: BorderSide.none,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// One expandable section in the grouped samples list: a [CollectionTile]
+/// header that toggles open/closed, and (when open) the section's [SampleTile]
+/// rows beneath it. Tap the header to expand/collapse; long-press inside is
+/// reserved for sample-level actions.
+class _CollectionSection extends StatelessWidget {
+  const _CollectionSection({
+    required this.group,
+    required this.expanded,
+    required this.onToggle,
+    required this.onOpenSample,
+    required this.onConfirmDelete,
+    required this.onDelete,
+  });
+
+  final _CollectionGroup group;
+  final bool expanded;
+  final VoidCallback onToggle;
+  final void Function(Sample) onOpenSample;
+  final Future<bool> Function(Sample) onConfirmDelete;
+  final Future<void> Function(Sample) onDelete;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const Divider(height: 1, color: Colors.white12),
+        CollectionTile(
+          collection: group.collection,
+          isUncollected: group.isUncollected,
+          sampleCount: group.samples.length,
+          lastSampleAt: group.sortKey,
+          coverImagePath: group.coverImagePath,
+          expanded: expanded,
+          onTap: onToggle,
+        ),
+        if (expanded)
+          for (final sample in group.samples) ...[
+            const Divider(height: 1, color: Colors.white12),
+            Dismissible(
+              key: ValueKey('sample-${sample.id}'),
+              direction: DismissDirection.endToStart,
+              background: Container(
+                color: Colors.redAccent,
+                alignment: Alignment.centerRight,
+                padding: const EdgeInsets.symmetric(horizontal: 24),
+                child: const Icon(Icons.delete, color: Colors.white),
+              ),
+              confirmDismiss: (_) => onConfirmDelete(sample),
+              onDismissed: (_) => onDelete(sample),
+              // Slight inset on the sample tile so the hierarchy reads
+              // "samples belong to the collection above."
+              child: Container(
+                padding: const EdgeInsets.only(left: 12),
+                color: Colors.white.withValues(alpha: 0.02),
+                child: SampleTile(
+                  sample: sample,
+                  onTap: () => onOpenSample(sample),
+                  onLongPress: () async {
+                    if (await onConfirmDelete(sample)) await onDelete(sample);
+                  },
+                ),
+              ),
+            ),
+          ],
+      ],
+    );
+  }
+}
+
+/// Header row for a collection (or the synthetic "Uncollected" group) on
+/// the samples scroll page. Shows the cover thumbnail (latest sample image,
+/// or a placeholder when empty), name, sample count, the timestamp of the
+/// latest capture, and a chevron that rotates to indicate expanded state.
+/// Tap toggles the section open/closed.
 class CollectionTile extends StatelessWidget {
   const CollectionTile({
     super.key,
@@ -320,16 +497,27 @@ class CollectionTile extends StatelessWidget {
     required this.lastSampleAt,
     required this.coverImagePath,
     required this.onTap,
+    this.isUncollected = false,
+    this.expanded = false,
   });
 
-  final Collection collection;
+  /// Null only when [isUncollected] is true (the synthetic bucket).
+  final Collection? collection;
+  final bool isUncollected;
   final int sampleCount;
   final DateTime lastSampleAt;
   final String? coverImagePath;
+
+  /// Controls the chevron rotation. The header is the same widget whether
+  /// expanded or not — the section below it appears/disappears around it.
+  final bool expanded;
   final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
+    final accent =
+        isUncollected ? Colors.white54 : Colors.amberAccent;
+    final name = isUncollected ? 'Uncollected' : collection!.name;
     return InkWell(
       onTap: onTap,
       child: Padding(
@@ -360,15 +548,17 @@ class CollectionTile extends StatelessWidget {
                 children: [
                   Row(
                     children: [
-                      const Icon(
-                        Icons.collections_bookmark_outlined,
+                      Icon(
+                        isUncollected
+                            ? Icons.inbox_outlined
+                            : Icons.collections_bookmark_outlined,
                         size: 14,
-                        color: Colors.amberAccent,
+                        color: accent,
                       ),
                       const SizedBox(width: 4),
                       Expanded(
                         child: Text(
-                          collection.name,
+                          name,
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: const TextStyle(
@@ -397,20 +587,34 @@ class CollectionTile extends StatelessWidget {
                   ),
                   const SizedBox(height: 4),
                   Text(
-                    sampleCount == 0
-                        ? 'Empty · created ${_formatDate(collection.createdAt)}'
-                        : 'Latest ${_formatDate(lastSampleAt)}',
+                    _subtitle(),
                     style: const TextStyle(
                         color: Colors.white54, fontSize: 13),
                   ),
                 ],
               ),
             ),
-            const Icon(Icons.chevron_right, color: Colors.white38),
+            AnimatedRotation(
+              turns: expanded ? 0.25 : 0,
+              duration: const Duration(milliseconds: 150),
+              child: const Icon(Icons.chevron_right, color: Colors.white38),
+            ),
           ],
         ),
       ),
     );
+  }
+
+  String _subtitle() {
+    if (isUncollected) {
+      return sampleCount == 0
+          ? 'No loose samples'
+          : 'Latest ${_formatDate(lastSampleAt)}';
+    }
+    if (sampleCount == 0) {
+      return 'Empty · created ${_formatDate(collection!.createdAt)}';
+    }
+    return 'Latest ${_formatDate(lastSampleAt)}';
   }
 }
 
