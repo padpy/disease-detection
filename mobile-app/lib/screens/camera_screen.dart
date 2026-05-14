@@ -167,10 +167,13 @@ class _CameraScreenState extends State<CameraScreen>
       await next.initialize();
       await next.lockCaptureOrientation(DeviceOrientation.portraitUp);
       await next.setFlashMode(_flashMode);
-      final reportedMin = await next.getMinZoomLevel();
-      minZoom = math.min(reportedMin, 0.5);
+      // Use what the active camera actually reports — forcing a 0.5x floor
+      // would re-enable the preset chip on hardware that physically can't
+      // zoom that wide (e.g. iOS opens only the wide-angle camera, min 1.0),
+      // and setZoomLevel(0.5) would silently throw.
+      minZoom = await next.getMinZoomLevel();
       maxZoom = await next.getMaxZoomLevel();
-      initialZoom = reportedMin.clamp(minZoom, maxZoom);
+      initialZoom = minZoom.clamp(minZoom, maxZoom);
       await next.setZoomLevel(initialZoom);
     } catch (_) {
       await next.dispose();
