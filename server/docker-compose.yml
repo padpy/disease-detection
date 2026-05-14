@@ -15,8 +15,30 @@ services:
       - ./trials:/app/trials
       - ./runs:/app/runs:ro
       - /home/nickp/development/grape/hf-models:/home/nickp/development/grape/hf-models:ro
+      # Read-only mount of the LLM source tree + checkpoints. The chatbot
+      # imports `src.BLIP_Qwen.*` from this root and loads the stage2
+      # adapter at the GOPHER_EYE_LLM_CKPT path below. Without this mount
+      # /v1/chat/completions returns 503 "chatbot is not configured".
+      - ../LLM_work:/app/LLM_work:ro
+      # Read-write HuggingFace cache from the host. The chatbot's
+      # `_load` pulls Qwen/Qwen3-1.7B and Salesforce/blip2-opt-2.7b via
+      # `from_pretrained`; without this mount every container restart
+      # would re-download multi-GB shards into ephemeral container
+      # storage. RW so a first-time BLIP2 fetch persists back to the
+      # host. HF_HOME below tells transformers/huggingface_hub to look
+      # here (it expects `<HF_HOME>/hub/models--*` and that's the
+      # layout of ~/.cache/huggingface on the host).
+      - /home/nickp/.cache/huggingface:/hf-cache
     environment:
       ENV: development
+      # Point the chatbot loader at the stage2 checkpoint dir + the
+      # LLM_work root (so `src.BLIP_Qwen` is importable). See
+      # build_chatbot_from_env in app/chatbot.py.
+      GOPHER_EYE_LLM_CKPT: /app/LLM_work/qwen3-1.7B-greenhouse-ngld-faithful-stage2
+      GOPHER_EYE_LLM_DIR: /app/LLM_work
+      # Share the host's HuggingFace cache (mounted above) so base
+      # models don't re-download on every container restart.
+      HF_HOME: /hf-cache
     # Hand both host GPUs to the container via the NVIDIA Container
     # Toolkit. Without this, torch/onnxruntime see no CUDA devices
     # regardless of whether they're CUDA-built wheels — SAM 3.1 then

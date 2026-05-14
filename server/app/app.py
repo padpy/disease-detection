@@ -1,5 +1,6 @@
 import os
 import platform
+import time
 
 import uvicorn
 
@@ -47,7 +48,21 @@ if __name__ == '__main__':
     if chatbot is None:
         print("Chatbot disabled: set GOPHER_EYE_LLM_CKPT (and GOPHER_EYE_LLM_DIR) to enable /v1/chat/completions")
     else:
-        print(f"Chatbot enabled: ckpt={chatbot.ckpt_dir} (lazy load on first request)")
+        print(f"Chatbot enabled: ckpt={chatbot.ckpt_dir}, preloading weights…", flush=True)
+        t0 = time.monotonic()
+        try:
+            chatbot.preload()
+        except Exception as err:  # noqa: BLE001 — log + boot anyway
+            print(
+                f"Chatbot preload failed after {time.monotonic() - t0:.1f}s: {err}. "
+                "Server will boot, but /v1/chat/completions will return 503 until fixed.",
+                flush=True,
+            )
+        else:
+            print(
+                f"Chatbot ready in {time.monotonic() - t0:.1f}s",
+                flush=True,
+            )
 
     storage = _build_storage()
     samples = SamplesService(

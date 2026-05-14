@@ -143,6 +143,12 @@ class _ChatbotScreenState extends State<ChatbotScreen> {
     bool initialDiagnosis = false,
   }) async {
     if (_sending) return;
+    debugPrint(
+      '[chatbot] thinking start: '
+      'initialDiagnosis=$initialDiagnosis, '
+      'visibleText=${visibleText == null ? "(suppressed)" : '"$visibleText"'}, '
+      'history=${_turns.length} turn(s)',
+    );
     setState(() {
       _sending = true;
       _error = null;
@@ -166,12 +172,12 @@ class _ChatbotScreenState extends State<ChatbotScreen> {
       );
       if (!mounted) return;
       final parsed = parseLeafDiagnosis(reply.content);
+      debugPrint(
+        '[chatbot] thinking done: reply=${reply.content.length} chars, '
+        'diagnosis=${parsed?.name ?? "(unparsed)"}',
+      );
       setState(() {
-        _turns.add(LlmTurn(
-          role: LlmRole.assistant,
-          content: reply.content,
-          displayContent: reply.displayContent,
-        ));
+        _turns.add(LlmTurn(role: LlmRole.assistant, content: reply.content));
         if (parsed != null) _diagnosis = parsed;
       });
       _scrollToBottom();
@@ -229,6 +235,7 @@ class _ChatbotScreenState extends State<ChatbotScreen> {
       });
       return;
     }
+    debugPrint('[chatbot] thinking: ${statuses.first}');
     setState(() {
       _statuses = statuses;
       _statusIdx = 0;
@@ -237,12 +244,14 @@ class _ChatbotScreenState extends State<ChatbotScreen> {
       if (!mounted) return;
       if (_statusIdx >= _statuses.length - 1) return;
       setState(() => _statusIdx += 1);
+      debugPrint('[chatbot] thinking: ${_statuses[_statusIdx]}');
     });
   }
 
   void _stopStatuses() {
     _statusTimer?.cancel();
     _statusTimer = null;
+    debugPrint('[chatbot] thinking stopped');
     setState(() {
       _statuses = const [];
       _statusIdx = 0;
@@ -403,8 +412,7 @@ class _ChatbotScreenState extends State<ChatbotScreen> {
                         final turn = item.turn!;
                         return _Bubble(
                           turn: turn,
-                          onLongPress: () =>
-                              _copy(turn.displayContent ?? turn.content),
+                          onLongPress: () => _copy(turn.content),
                         );
                       },
                     ),
@@ -601,8 +609,7 @@ class _BubbleState extends State<_Bubble> {
     final base = TextStyle(color: fg, fontSize: 14, height: 1.35);
 
     _disposeRecognisers();
-    final shown = widget.turn.displayContent ?? widget.turn.content;
-    final spans = _buildSpans(shown, base, linkColor);
+    final spans = _buildSpans(widget.turn.content, base, linkColor);
 
     return Align(
       alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,

@@ -13,3 +13,4 @@ scipy
 SQLAlchemy
 firebase-auth
 transformers
+peft

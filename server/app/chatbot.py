@@ -80,6 +80,13 @@ class ChatbotService:
 
     # ---------------------- model loading ----------------------
 
+    def preload(self):
+        """Eagerly load weights now so the first chat request doesn't pay the
+        load cost. Re-raises ChatbotError on failure with the same envelope
+        chat_completion would return; the failure is also cached in
+        _load_error so subsequent requests fail fast without re-trying."""
+        self._ensure_loaded()
+
     def _ensure_loaded(self):
         if self._loaded:
             return

@@ -73,7 +73,12 @@ class AppSettings {
   static const _envOpenAiKey = String.fromEnvironment('OPENAI_API_KEY');
   static const _envServerUrl = String.fromEnvironment('GOPHER_EYE_SERVER_URL');
 
-  static const defaultOpenAiModel = 'gpt-5';
+  // gpt-5.5 snapshot pinned by date so we don't silently float onto a newer
+  // family rev. The model is exposed on Chat Completions (what
+  // langchain_openai 0.7.x talks to) with the same request shape as 5.x —
+  // accepts `temperature`, accepts `model`/`messages`, and the SDK already
+  // emits `max_completion_tokens` rather than `max_tokens`.
+  static const defaultOpenAiModel = 'gpt-5.5-2026-04-23';
   static const defaultServerLlmModel = 'gopher-eye-grape-leaf';
   static const defaultZtNetworkId = '6ab565387a1297b5';
 
