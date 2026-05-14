@@ -276,7 +276,9 @@ class ChatService {
   /// One-shot OpenAI call that turns the local specialist's terse diagnosis
   /// (`rawLocalResponse`) into the canonical user-facing reply ending with
   /// "Diagnosis: …". No chat history attached — this is pure extraction.
-  /// Temperature is 0 so the category mapping is deterministic.
+  /// We do NOT set `temperature`: gpt-5.5 rejects any value other than 1
+  /// ("Only the default (1) value is supported"); the strict prompt format
+  /// is what we rely on for category-mapping consistency now.
   Future<String> _extractDiagnosisViaOpenAI(String rawLocalResponse) async {
     final apiKey = await AppSettings.getOpenAiApiKey();
     if (apiKey == null || apiKey.isEmpty) {
@@ -288,10 +290,7 @@ class ChatService {
     final modelName = await AppSettings.getOpenAiModel();
     final llm = ChatOpenAI(
       apiKey: apiKey,
-      defaultOptions: ChatOpenAIOptions(
-        model: modelName,
-        temperature: 0.0,
-      ),
+      defaultOptions: ChatOpenAIOptions(model: modelName),
     );
     final messages = <ChatMessage>[
       ChatMessage.system(kDiagnosisExtractionPrompt),
@@ -314,12 +313,12 @@ class ChatService {
       );
     }
     final modelName = await AppSettings.getOpenAiModel();
+    // No `temperature` — gpt-5.5 rejects any value other than 1 with
+    // {"code":"unsupported_value","param":"temperature"}. Leave it
+    // unset and let the API use the default.
     final llm = ChatOpenAI(
       apiKey: apiKey,
-      defaultOptions: ChatOpenAIOptions(
-        model: modelName,
-        temperature: 0.4,
-      ),
+      defaultOptions: ChatOpenAIOptions(model: modelName),
     );
     final messages = <ChatMessage>[
       ChatMessage.system(systemPrompt),
