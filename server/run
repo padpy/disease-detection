@@ -85,8 +85,26 @@ echo "Starting $CONTAINER on $HOST_IP:$PORT (api + chatbot)"
 echo "  LLM_CKPT: $LLM_CKPT"
 echo "  LLM_DIR:  $LLM_DIR"
 
+# Per-device passthrough is needed alongside `--gpus all` because the
+# host has `no-cgroups = true` in /etc/nvidia-container-runtime/config.toml
+# (the rootless-Docker default). `--gpus all` still mounts the driver
+# libraries via the NVIDIA toolkit hook, but with `no-cgroups = true`
+# the toolkit doesn't set up the cgroup device rules — without these
+# explicit `--device` flags the container can dlopen libcuda but
+# `nvidia-smi`/`torch.cuda.is_available()` fail with NVML init errors
+# and SAM 3 silently falls back to CPU.
+GPU_DEVICE_FLAGS=()
+# `-c` (character device) filter is intentional — the glob also matches
+# the `/dev/nvidia-caps` directory itself; passing a dir to `--device`
+# trips a docker error.
+for dev in /dev/nvidia* /dev/nvidia-caps/nvidia-cap*; do
+  [[ -c "$dev" ]] && GPU_DEVICE_FLAGS+=(--device "$dev")
+done
+
 exec docker run \
   "${RUN_MODE[@]}" \
+  --gpus all \
+  "${GPU_DEVICE_FLAGS[@]}" \
   --name "$CONTAINER" \
   -p "${HOST_IP}:${PORT}:5000" \
   -e GOPHER_EYE_LLM_CKPT=/llm/ckpt \

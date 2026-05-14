@@ -69,12 +69,32 @@ class WheatHeadDetector:
     ):
         if ort is None:
             raise RuntimeError(
-                "onnxruntime is not installed; add 'onnxruntime' to requirements.txt"
+                "onnxruntime is not installed; add 'onnxruntime-gpu' to requirements.txt"
             )
         if not os.path.isfile(onnx_path):
             raise FileNotFoundError(onnx_path)
-        providers = list(providers) if providers else ["CPUExecutionProvider"]
-        self.session = ort.InferenceSession(onnx_path, providers=providers)
+        if providers is None:
+            # Prefer GPU when the installed wheel exposes it. The default
+            # `onnxruntime` wheel is CPU-only — to actually get CUDA here
+            # the deploy must install `onnxruntime-gpu` against a matching
+            # CUDA runtime. We always keep CPU as a fallback so a missing
+            # CUDA runtime degrades gracefully instead of failing boot.
+            available = set(ort.get_available_providers())
+            if "CUDAExecutionProvider" in available:
+                providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            else:
+                providers = ["CPUExecutionProvider"]
+                print(
+                    "[wheat-head] WARNING: CUDAExecutionProvider not "
+                    "available; running YOLO26 on CPU. Install "
+                    "'onnxruntime-gpu' with a matching CUDA runtime to "
+                    "enable GPU inference."
+                )
+        self.session = ort.InferenceSession(onnx_path, providers=list(providers))
+        print(
+            f"[wheat-head] onnxruntime providers active: "
+            f"{self.session.get_providers()}"
+        )
         self.input_name = self.session.get_inputs()[0].name
 
     def detect(

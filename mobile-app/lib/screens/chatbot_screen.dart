@@ -1,9 +1,11 @@
 import 'dart:async';
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:gopher_eye/services/chat_service.dart';
 import 'package:gopher_eye/services/grape_leaf_pipeline.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 /// Ad-hoc chat about a single image. Holds the transcript in memory only —
 /// the session ends when the user pops back to the camera. There's no
@@ -549,21 +551,57 @@ class _PreviewBadge extends StatelessWidget {
   }
 }
 
-class _Bubble extends StatelessWidget {
+class _Bubble extends StatefulWidget {
   const _Bubble({required this.turn, this.onLongPress});
 
   final LlmTurn turn;
   final VoidCallback? onLongPress;
 
   @override
+  State<_Bubble> createState() => _BubbleState();
+}
+
+class _BubbleState extends State<_Bubble> {
+  /// Recognisers owned by this bubble. Each linkified URL needs its own
+  /// recogniser; we hold them so we can dispose them when the bubble's
+  /// content changes or the bubble unmounts.
+  final List<TapGestureRecognizer> _recognisers = [];
+
+  @override
+  void didUpdateWidget(covariant _Bubble oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.turn.content != widget.turn.content) _disposeRecognisers();
+  }
+
+  @override
+  void dispose() {
+    _disposeRecognisers();
+    super.dispose();
+  }
+
+  void _disposeRecognisers() {
+    for (final r in _recognisers) {
+      r.dispose();
+    }
+    _recognisers.clear();
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final isUser = turn.role == LlmRole.user;
+    final isUser = widget.turn.role == LlmRole.user;
     final bg = isUser ? Colors.white : const Color(0xFF1E1E1E);
     final fg = isUser ? Colors.black : Colors.white;
+    final linkColor =
+        isUser ? Colors.blue.shade800 : Colors.lightBlueAccent;
+    final base = TextStyle(color: fg, fontSize: 14, height: 1.35);
+
+    _disposeRecognisers();
+    final spans = _buildSpans(widget.turn.content, base, linkColor);
+
     return Align(
       alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
       child: GestureDetector(
-        onLongPress: onLongPress,
+        onLongPress: widget.onLongPress,
         child: Container(
           margin: const EdgeInsets.symmetric(vertical: 4),
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
@@ -574,14 +612,89 @@ class _Bubble extends StatelessWidget {
             color: bg,
             borderRadius: BorderRadius.circular(14),
           ),
-          child: Text(
-            turn.content,
-            style: TextStyle(color: fg, fontSize: 14, height: 1.35),
-          ),
+          child: Text.rich(TextSpan(style: base, children: spans)),
         ),
       ),
     );
   }
+
+  List<InlineSpan> _buildSpans(
+    String content,
+    TextStyle baseStyle,
+    Color linkColor,
+  ) {
+    final spans = <InlineSpan>[];
+    var cursor = 0;
+    for (final match in _kUrlPattern.allMatches(content)) {
+      if (match.start > cursor) {
+        spans.add(TextSpan(text: content.substring(cursor, match.start)));
+      }
+      final raw = match.group(0)!;
+      // Trailing punctuation often sits next to URLs in prose ("see foo.org.").
+      // Strip it from the link target and push it back into the surrounding
+      // text so the recogniser doesn't activate on the period.
+      final stripped = _stripTrailingPunctuation(raw);
+      final url = stripped.url;
+      final recogniser = TapGestureRecognizer()
+        ..onTap = () => _open(url);
+      _recognisers.add(recogniser);
+      spans.add(TextSpan(
+        text: url,
+        style: baseStyle.copyWith(
+          color: linkColor,
+          decoration: TextDecoration.underline,
+          decorationColor: linkColor,
+        ),
+        recognizer: recogniser,
+      ));
+      if (stripped.trailing.isNotEmpty) {
+        spans.add(TextSpan(text: stripped.trailing));
+      }
+      cursor = match.end;
+    }
+    if (cursor < content.length) {
+      spans.add(TextSpan(text: content.substring(cursor)));
+    }
+    return spans;
+  }
+
+  Future<void> _open(String url) async {
+    final uri = Uri.tryParse(url);
+    if (uri == null) return;
+    final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
+    if (!ok && mounted) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(
+          content: Text('Could not open $url'),
+          duration: const Duration(seconds: 2),
+          behavior: SnackBarBehavior.floating,
+        ));
+    }
+  }
+}
+
+/// Matches plain http(s) URLs. We deliberately don't try to detect bare
+/// domains — the LLM is instructed to emit fully qualified links.
+final RegExp _kUrlPattern = RegExp(
+  r'https?://[^\s<>()\[\]{}"' "'" r']+',
+  caseSensitive: false,
+);
+
+class _StrippedUrl {
+  const _StrippedUrl(this.url, this.trailing);
+  final String url;
+  final String trailing;
+}
+
+_StrippedUrl _stripTrailingPunctuation(String raw) {
+  const trailing = '.,;:!?)]}>';
+  var end = raw.length;
+  while (end > 0 && trailing.contains(raw[end - 1])) {
+    end -= 1;
+  }
+  if (end == raw.length) return _StrippedUrl(raw, '');
+  return _StrippedUrl(raw.substring(0, end), raw.substring(end));
 }
 
 /// Assistant-side "thinking" bubble. Shows the current rotating-status line

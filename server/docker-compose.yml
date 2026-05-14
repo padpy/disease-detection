@@ -17,4 +17,17 @@ services:
       - /home/nickp/development/grape/hf-models:/home/nickp/development/grape/hf-models:ro
     environment:
       ENV: development
+    # Hand both host GPUs to the container via the NVIDIA Container
+    # Toolkit. Without this, torch/onnxruntime see no CUDA devices
+    # regardless of whether they're CUDA-built wheels — SAM 3.1 then
+    # silently falls back to CPU (~45s/forward instead of ~0.2s on the
+    # 3090 Ti). The toolkit must be installed on the host (verify with
+    # ``nvidia-container-toolkit --version``).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     restart: unless-stopped

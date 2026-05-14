@@ -72,11 +72,11 @@ const String kExplainDiagnosisPrompt =
     '(e.g. lesion shape, colour, distribution, texture) rather than general '
     'disease facts. Keep the tone friendly and concrete.';
 
-/// System prompt for the local/server model during the hybrid initial-
-/// diagnosis flow. The specialist model gets the analytical job: list what
-/// it sees and pick a category. OpenAI handles the user-facing copy in a
-/// second pass, so this prompt deliberately doesn't constrain length or
-/// tone — only output structure.
+/// System prompt for the local/server model during the initial diagnosis.
+/// The specialist model is the only thing that ever sees the leaf image, so
+/// it carries the full diagnostic vocabulary plus tone constraints — its
+/// output is what the user sees verbatim and what OpenAI uses as the
+/// descriptive context for any later follow-ups.
 const String kLocalDiagnosticPrompt =
     'You are a specialist grape-leaf disease model. Examine the attached '
     'leaf image and list the visible symptoms you observe (colour, texture, '
@@ -87,21 +87,26 @@ const String kLocalDiagnosticPrompt =
     'downy mildew shows oily yellow, brown, or black spots on the top of '
     'the leaf, the same symptoms on the underside, or a white thicker mold '
     'on the underside. '
-    'End with the chosen diagnosis on its own line in the form '
+    'Respond in a concise, friendly manner acknowledging reviewing the leaf '
+    'and providing the diagnosis. End with the chosen diagnosis on its own '
+    'line in the form '
     '"Diagnosis: <one of: healthy, downy mildew, powdery mildew, other disease>".';
 
-/// System prompt for the OpenAI summariser pass. Given the local model's
-/// notes (observations + diagnosis), it produces the friendly two-sentence
-/// reply the user actually sees. Preserves the local's diagnosis verbatim.
-const String kSummarizerSystemPrompt =
-    'You are an agronomist relaying a specialist colleague\'s leaf diagnosis '
-    'to a grower. You will receive the specialist\'s notes (observations + '
-    'chosen diagnosis) alongside the leaf image. Acknowledge the review in '
-    'two short, friendly sentences that reference the single most telling '
-    'symptom from the notes, then end with the diagnosis on its own line in '
-    'the form '
-    '"Diagnosis: <one of: healthy, downy mildew, powdery mildew, other disease>". '
-    'Use the specialist\'s chosen diagnosis verbatim; do not change it.';
+/// System prompt for OpenAI when it is being used as the follow-up brain
+/// after a local-LLM diagnosis. OpenAI never sees the leaf image in this
+/// mode; the specialist's notes (passed via chat history) are the only
+/// description of what the leaf looks like, so the prompt tells OpenAI to
+/// treat those notes as ground truth.
+const String kFollowUpSystemPrompt =
+    'You are an agronomist helping a grower follow up on a leaf diagnosis '
+    'that a specialist colleague already produced. You do not have access '
+    'to the leaf image — rely entirely on the specialist\'s notes earlier '
+    'in this conversation (observed symptoms and the chosen diagnosis) for '
+    'what the leaf looks like. Do not change the specialist\'s diagnosis. '
+    'When the user asks for explanations, treatments, or resources, ground '
+    'every observation in those notes and answer in a concise, friendly '
+    'tone. Feel free to include relevant web links (e.g. extension program '
+    'pages) as plain http(s) URLs when they help the grower.';
 
 /// Routes chat prompts to whichever LLM provider the user has configured. The
 /// system prompt + chat history are built the same way regardless of provider
@@ -141,11 +146,15 @@ class ChatService {
   /// [history] is every prior turn in order, *not* including the user turn
   /// being sent now. Returns the assistant's text reply.
   ///
-  /// When [initialDiagnosis] is true *and* the active provider is the
-  /// local/server model, we run a two-stage pipeline: the specialist server
-  /// model produces the raw diagnosis, then OpenAI rewrites it into the
-  /// user-facing two-sentence summary. If OpenAI isn't configured we fall
-  /// back to the local model's raw output so the user still gets an answer.
+  /// Routing rules when the active provider is the local/server model:
+  ///   * [initialDiagnosis] requests go to the local LLM and its output is
+  ///     returned verbatim — the user only ever sees the specialist's
+  ///     diagnosis on the first turn.
+  ///   * Every other turn is routed to OpenAI, which never receives the
+  ///     image. The chat history (containing the local LLM's symptoms +
+  ///     diagnosis) is the descriptive context it works from.
+  /// When the active provider is OpenAI, every turn goes to OpenAI with the
+  /// leaf image attached — that flow is unchanged.
   Future<String> reply({
     required Uint8List imagePng,
     required List<LlmTurn> history,
@@ -154,75 +163,29 @@ class ChatService {
   }) async {
     final provider = await AppSettings.getLlmProvider();
 
-    if (initialDiagnosis && provider == LlmProvider.server) {
-      final notes = await _replyServer(
-        systemPrompt: kLocalDiagnosticPrompt,
+    if (provider == LlmProvider.server) {
+      if (initialDiagnosis) {
+        return _replyServer(
+          systemPrompt: kLocalDiagnosticPrompt,
+          history: history,
+          userMessage: userMessage,
+          imagePng: imagePng,
+        );
+      }
+      return _replyOpenAI(
+        systemPrompt: kFollowUpSystemPrompt,
         history: history,
         userMessage: userMessage,
-        imagePng: imagePng,
-      );
-      try {
-        return await _summarizeWithOpenAI(
-          diagnosticNotes: notes,
-          imagePng: imagePng,
-        );
-      } on ChatConfigException {
-        return notes;
-      }
-    }
-
-    switch (provider) {
-      case LlmProvider.openai:
-        return _replyOpenAI(
-          systemPrompt: kAgronomistSystemPrompt,
-          history: history,
-          userMessage: userMessage,
-          imagePng: imagePng,
-        );
-      case LlmProvider.server:
-        return _replyServer(
-          systemPrompt: kAgronomistSystemPrompt,
-          history: history,
-          userMessage: userMessage,
-          imagePng: imagePng,
-        );
-    }
-  }
-
-  /// Second-pass summariser used by the hybrid initial-diagnosis flow. Takes
-  /// the local model's raw observations + diagnosis and produces the
-  /// user-facing reply via OpenAI. Throws [ChatConfigException] if no OpenAI
-  /// key is configured — caller decides whether to fall back.
-  Future<String> _summarizeWithOpenAI({
-    required String diagnosticNotes,
-    required Uint8List imagePng,
-  }) async {
-    final apiKey = await AppSettings.getOpenAiApiKey();
-    if (apiKey == null || apiKey.isEmpty) {
-      throw const ChatConfigException(
-        'OpenAI API key not set; cannot summarise the local diagnosis.',
+        imagePng: Uint8List(0),
       );
     }
-    final modelName = await AppSettings.getOpenAiModel();
-    final llm = ChatOpenAI(
-      apiKey: apiKey,
-      defaultOptions: ChatOpenAIOptions(
-        model: modelName,
-        temperature: 0.3,
-      ),
+
+    return _replyOpenAI(
+      systemPrompt: kAgronomistSystemPrompt,
+      history: history,
+      userMessage: userMessage,
+      imagePng: imagePng,
     );
-    final userPrompt =
-        'Specialist model\'s diagnostic notes for the attached leaf:\n\n'
-        '$diagnosticNotes\n\n'
-        'Summarise the diagnosis for the grower in the required two-sentence '
-        '+ "Diagnosis: …" line format. Reference the single most telling '
-        'symptom from the notes. Use the specialist\'s diagnosis verbatim.';
-    final messages = <ChatMessage>[
-      ChatMessage.system(kSummarizerSystemPrompt),
-      _humanWithImage(userPrompt, imagePng),
-    ];
-    final result = await llm.invoke(PromptValue.chat(messages));
-    return result.output.content;
   }
 
   Future<String> _replyOpenAI({

@@ -7,7 +7,7 @@ pillow
 numpy
 pytest
 ultralytics
-onnxruntime
+onnxruntime-gpu
 opencv-python
 scipy
 SQLAlchemy
