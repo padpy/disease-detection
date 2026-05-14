@@ -24,10 +24,31 @@ enum LlmRole { user, assistant, system }
 /// One message in an in-memory chat session. Camera-driven chats don't
 /// persist, so this is the smallest possible turn struct — no DB id, no
 /// timestamps.
+///
+/// [displayContent], when non-null, is what the UI renders for this turn;
+/// [content] is always what gets sent to the LLM as chat history. This split
+/// exists because the local specialist's initial reply contains a detailed
+/// symptom analysis that we want OpenAI to read on follow-ups, but the user
+/// should only see the brief diagnosis summary.
 class LlmTurn {
-  const LlmTurn({required this.role, required this.content});
+  const LlmTurn({
+    required this.role,
+    required this.content,
+    this.displayContent,
+  });
   final LlmRole role;
   final String content;
+  final String? displayContent;
+}
+
+/// Return shape for [ChatService.reply]. [content] is the full assistant text
+/// that goes into chat history; [displayContent], when set, is the trimmed
+/// version to render in the bubble (currently only used to hide the local
+/// specialist's symptom dump from the user).
+class ChatReply {
+  const ChatReply({required this.content, this.displayContent});
+  final String content;
+  final String? displayContent;
 }
 
 /// The four diagnoses the chatbot is constrained to. Matches the categories
@@ -73,24 +94,28 @@ const String kExplainDiagnosisPrompt =
     'disease facts. Keep the tone friendly and concrete.';
 
 /// System prompt for the local/server model during the initial diagnosis.
-/// The specialist model is the only thing that ever sees the leaf image, so
-/// it carries the full diagnostic vocabulary plus tone constraints — its
-/// output is what the user sees verbatim and what OpenAI uses as the
-/// descriptive context for any later follow-ups.
+/// The specialist model is the only thing that ever sees the leaf image. Its
+/// reply is split on the literal `---SUMMARY---` marker: the part before is
+/// passed to OpenAI as descriptive context for follow-ups, the part after is
+/// what the user sees in the chat bubble.
 const String kLocalDiagnosticPrompt =
     'You are a specialist grape-leaf disease model. Examine the attached '
-    'leaf image and list the visible symptoms you observe (colour, texture, '
-    'location on leaf, distribution). Then choose one diagnosis from: '
-    'healthy, downy mildew, powdery mildew, or other disease. '
-    'Use these symptom hints: '
-    'powdery mildew shows a powdery white substance on the tops of leaves; '
-    'downy mildew shows oily yellow, brown, or black spots on the top of '
-    'the leaf, the same symptoms on the underside, or a white thicker mold '
-    'on the underside. '
-    'Respond in a concise, friendly manner acknowledging reviewing the leaf '
-    'and providing the diagnosis. End with the chosen diagnosis on its own '
+    'leaf image and produce a response in TWO sections, separated by the '
+    'literal line "---SUMMARY---".\n'
+    'Section 1 (before the separator): list the visible symptoms you '
+    'observe (colour, texture, location on leaf, distribution) in detail. '
+    'This section is internal context for a colleague and will not be '
+    'shown to the user.\n'
+    'Section 2 (after the separator): a concise, friendly two-sentence '
+    'reply acknowledging that you reviewed the leaf and providing the '
+    'diagnosis. End this section with the chosen diagnosis on its own '
     'line in the form '
-    '"Diagnosis: <one of: healthy, downy mildew, powdery mildew, other disease>".';
+    '"Diagnosis: <one of: healthy, downy mildew, powdery mildew, other disease>".\n'
+    'Symptom hints: powdery mildew shows a powdery white substance on the '
+    'tops of leaves; downy mildew shows oily yellow, brown, or black '
+    'spots on the top of the leaf, the same symptoms on the underside, or '
+    'a white thicker mold on the underside. '
+    'Always emit the "---SUMMARY---" separator even if section 1 is brief.';
 
 /// System prompt for OpenAI when it is being used as the follow-up brain
 /// after a local-LLM diagnosis. OpenAI never sees the leaf image in this
@@ -144,18 +169,21 @@ class ChatService {
 
   /// Send [userMessage] alongside [imagePng] for the active chatbot session.
   /// [history] is every prior turn in order, *not* including the user turn
-  /// being sent now. Returns the assistant's text reply.
+  /// being sent now. Returns the assistant's reply as a [ChatReply] — the
+  /// caller stores `content` in chat history and renders
+  /// `displayContent ?? content` in the bubble.
   ///
   /// Routing rules when the active provider is the local/server model:
-  ///   * [initialDiagnosis] requests go to the local LLM and its output is
-  ///     returned verbatim — the user only ever sees the specialist's
-  ///     diagnosis on the first turn.
+  ///   * [initialDiagnosis] requests go to the local LLM; its raw output is
+  ///     split on `---SUMMARY---` so the user only sees the friendly
+  ///     diagnosis line, while the full symptom analysis stays in chat
+  ///     history for OpenAI to read on follow-ups.
   ///   * Every other turn is routed to OpenAI, which never receives the
-  ///     image. The chat history (containing the local LLM's symptoms +
+  ///     image — the chat history (containing the local LLM's symptoms +
   ///     diagnosis) is the descriptive context it works from.
   /// When the active provider is OpenAI, every turn goes to OpenAI with the
   /// leaf image attached — that flow is unchanged.
-  Future<String> reply({
+  Future<ChatReply> reply({
     required Uint8List imagePng,
     required List<LlmTurn> history,
     required String userMessage,
@@ -165,27 +193,50 @@ class ChatService {
 
     if (provider == LlmProvider.server) {
       if (initialDiagnosis) {
-        return _replyServer(
+        final raw = await _replyServer(
           systemPrompt: kLocalDiagnosticPrompt,
           history: history,
           userMessage: userMessage,
           imagePng: imagePng,
         );
+        return ChatReply(
+          content: raw,
+          displayContent: _extractLocalDiagnosisSummary(raw),
+        );
       }
-      return _replyOpenAI(
+      final raw = await _replyOpenAI(
         systemPrompt: kFollowUpSystemPrompt,
         history: history,
         userMessage: userMessage,
         imagePng: Uint8List(0),
       );
+      return ChatReply(content: raw);
     }
 
-    return _replyOpenAI(
+    final raw = await _replyOpenAI(
       systemPrompt: kAgronomistSystemPrompt,
       history: history,
       userMessage: userMessage,
       imagePng: imagePng,
     );
+    return ChatReply(content: raw);
+  }
+
+  /// Pull the user-visible portion out of the local specialist's reply. The
+  /// prompt asks for `---SUMMARY---` as a separator; we accept minor
+  /// formatting drift (extra dashes, surrounding whitespace, varied case)
+  /// because small models often re-format the marker. If the marker is
+  /// missing or the summary section is empty, return null so the caller
+  /// falls back to showing the full reply.
+  String? _extractLocalDiagnosisSummary(String content) {
+    final marker = RegExp(
+      r'-{2,}\s*summary\s*-{2,}',
+      caseSensitive: false,
+    );
+    final match = marker.firstMatch(content);
+    if (match == null) return null;
+    final summary = content.substring(match.end).trim();
+    return summary.isEmpty ? null : summary;
   }
 
   Future<String> _replyOpenAI({

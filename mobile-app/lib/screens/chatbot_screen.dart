@@ -165,9 +165,13 @@ class _ChatbotScreenState extends State<ChatbotScreen> {
         initialDiagnosis: initialDiagnosis,
       );
       if (!mounted) return;
-      final parsed = parseLeafDiagnosis(reply);
+      final parsed = parseLeafDiagnosis(reply.content);
       setState(() {
-        _turns.add(LlmTurn(role: LlmRole.assistant, content: reply));
+        _turns.add(LlmTurn(
+          role: LlmRole.assistant,
+          content: reply.content,
+          displayContent: reply.displayContent,
+        ));
         if (parsed != null) _diagnosis = parsed;
       });
       _scrollToBottom();
@@ -399,7 +403,8 @@ class _ChatbotScreenState extends State<ChatbotScreen> {
                         final turn = item.turn!;
                         return _Bubble(
                           turn: turn,
-                          onLongPress: () => _copy(turn.content),
+                          onLongPress: () =>
+                              _copy(turn.displayContent ?? turn.content),
                         );
                       },
                     ),
@@ -596,7 +601,8 @@ class _BubbleState extends State<_Bubble> {
     final base = TextStyle(color: fg, fontSize: 14, height: 1.35);
 
     _disposeRecognisers();
-    final spans = _buildSpans(widget.turn.content, base, linkColor);
+    final shown = widget.turn.displayContent ?? widget.turn.content;
+    final spans = _buildSpans(shown, base, linkColor);
 
     return Align(
       alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
